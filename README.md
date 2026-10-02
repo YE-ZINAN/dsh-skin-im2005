@@ -1,4 +1,4 @@
-# IM2005 — 2005 年代即时通讯风格皮肤 · DeepSeek Harness
+# IM2005 — 2005 年代QQ聊天框风格皮肤 · DeepSeek Harness
 
 把 **DeepSeek Harness 桌面端**换成 2005 年即时通讯软件的样子：直角窗口、1px 硬边框、宋体、蓝色渐变标题栏、好友分组式侧栏，还有一条"形象秀"右侧列。
 
