@@ -1,0 +1,7 @@
+# dsh-skin-im2005 — bundle patch
+#
+# 只插入一行：挂载本包。
+# 注意：patch 是「按 id 定位 + 整行替换 config」的，所以这里不要顺带覆盖别的行。
+- insert:
+    - id: dsh-skin-im2005
+      name: dsh-skin-im2005

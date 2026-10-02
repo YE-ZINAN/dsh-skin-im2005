@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" shape-rendering="crispEdges">
+  <!-- Original artwork: a 2005-era IM window with a pixel penguin. No third-party assets. -->
+  <rect x="2" y="6" width="60" height="52" fill="#ece9d8" stroke="#7f9db9" stroke-width="2"/>
+  <rect x="2" y="6" width="60" height="10" fill="#316ac5"/>
+  <rect x="2" y="16" width="60" height="1" fill="#245a9f"/>
+  <rect x="47" y="9" width="10" height="2" fill="#dfe8f7"/>
+  <rect x="47" y="12" width="10" height="1" fill="#dfe8f7"/>
+  <rect x="8" y="24" width="48" height="26" fill="#ffffff" stroke="#c2beb2"/>
+  <!-- pixel penguin -->
+  <g transform="translate(24 28)">
+    <rect x="4" y="0" width="8" height="2" fill="#111"/>
+    <rect x="2" y="2" width="12" height="3" fill="#111"/>
+    <rect x="4" y="2" width="2" height="2" fill="#fff"/>
+    <rect x="4" y="3" width="2" height="1" fill="#111"/>
+    <rect x="10" y="2" width="2" height="2" fill="#fff"/>
+    <rect x="10" y="3" width="2" height="1" fill="#111"/>
+    <rect x="7" y="5" width="3" height="1" fill="#f4a300"/>
+    <rect x="2" y="5" width="12" height="10" fill="#111"/>
+    <rect x="4" y="6" width="8" height="8" fill="#fff"/>
+    <rect x="4" y="6" width="8" height="1" fill="#316ac5"/>
+    <rect x="4" y="15" width="3" height="2" fill="#f4a300"/>
+    <rect x="9" y="15" width="3" height="2" fill="#f4a300"/>
+  </g>
+  <rect x="8" y="53" width="14" height="3" fill="#d4d0c8" stroke="#9a9a92"/>
+  <rect x="44" y="53" width="12" height="3" fill="#d4d0c8" stroke="#9a9a92"/>
+</svg>
