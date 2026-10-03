@@ -470,14 +470,16 @@ const HAS_POOL = labels.some((l) => String(l).includes('美式八球'))
 const HAS_MINE = labels.some((l) => String(l).includes('扫雷'))
 const HAS_NOTE = labels.some((l) => String(l).includes('跨会话备注框'))
 const HAS_FARM = labels.some((l) => String(l).includes('Token农场'))
+const HAS_TASKS = labels.some((l) => String(l).includes('后台任务'))
 if (!labels.some((l) => String(l).includes('余额'))) fail('缺少余额按钮，实得 ' + JSON.stringify(labels))
 if (!labels.some((l) => String(l).includes('形象秀'))) fail('缺少 形象秀固定按钮，实得 ' + JSON.stringify(labels))
 if (!HAS_POOL) fail('缺少「美式八球」按钮，实得 ' + JSON.stringify(labels))
 if (!HAS_MINE) fail('缺少「扫雷」按钮，实得 ' + JSON.stringify(labels))
 if (!HAS_NOTE) fail('缺少「跨会话备注框」按钮，实得 ' + JSON.stringify(labels))
 if (!HAS_FARM) fail('缺少「Token农场」按钮，实得 ' + JSON.stringify(labels))
+if (!HAS_TASKS) fail('缺少「后台任务」按钮，实得 ' + JSON.stringify(labels))
 {
-  const want = 2 + (HAS_NOTIFY ? 1 : 0) + (HAS_POOL ? 1 : 0) + (HAS_MINE ? 1 : 0) + (HAS_NOTE ? 1 : 0) + (HAS_FARM ? 1 : 0)
+  const want = 2 + (HAS_NOTIFY ? 1 : 0) + (HAS_POOL ? 1 : 0) + (HAS_MINE ? 1 : 0) + (HAS_NOTE ? 1 : 0) + (HAS_FARM ? 1 : 0) + (HAS_TASKS ? 1 : 0)
   if (toolBtns.length !== want) fail('工具条按钮数应为 ' + want + '，实际 ' + toolBtns.length)
   // 顺序也要钉住：备注框排在「提醒声」之后、「美式八球」之前（用户指定）
   {
@@ -488,6 +490,7 @@ if (!HAS_FARM) fail('缺少「Token农场」按钮，实得 ' + JSON.stringify(l
     }
     if (!(at('跨会话备注框') < at('美式八球'))) fail('备注框应排在美式八球之前，实得 ' + JSON.stringify(labels))
     if (!(at('Token农场') > at('扫雷'))) fail('农场应排在扫雷之后，实得 ' + JSON.stringify(labels))
+    if (!(at('后台任务') > at('Token农场'))) fail('后台任务应排在 Token农场 右边，实得 ' + JSON.stringify(labels))
   }
 }
 ok(toolBtns.length + ' 个按钮: ' + JSON.stringify(labels))
@@ -3136,6 +3139,189 @@ console.log('\n=== 17. 静态审计：功能之间不许互相改共享状态 ==
     if (bad.length) fail('跨功能写存储键: ' + JSON.stringify(bad))
   }
   ok('静态审计：农场不碰全局音效/提醒状态；poolSfx.on 只在音效区写；各功能只写自己的存储键')
+}
+
+
+console.log('\n=== 18. 后台任务监控：计时 / 结束 / 清理 + 不许碰提醒音 ===')
+{
+  const src = fs.readFileSync('dsh-skin-im2005/client.js', 'utf8')
+  // 从标记区里把引擎取出来单独跑（它不依赖其它代码）
+  const a = src.indexOf('/* TASK-ENGINE:BEGIN */')
+  const b = src.indexOf('/* TASK-ENGINE:END */')
+  if (a < 0 || b < 0) fail('找不到 TASK-ENGINE 标记区')
+  const body = src.slice(a, b)
+  const factory = new Function(body + '\nreturn { TASKS, taskClock, createTaskEngine }')
+  const { TASKS, taskClock, createTaskEngine } = factory()
+
+  // ① 时间格式
+  {
+    if (taskClock(0) !== '0:00') fail('0 应格式化成 0:00，实得 ' + taskClock(0))
+    if (taskClock(83000) !== '1:23') fail('83 秒应是 1:23，实得 ' + taskClock(83000))
+    if (taskClock(3723000) !== '1:02:03') fail('3723 秒应是 1:02:03，实得 ' + taskClock(3723000))
+    if (taskClock(-5) !== '0:00') fail('负数应夹到 0:00')
+  }
+  ok('任务监控：计时格式（0:00 / 1:23 / 1:02:03，负数夹零）')
+
+  // ② 首次看见就开始计时；一直看见就一直累加（这是宿主不给开始时间、只能自己记的核心逻辑）
+  {
+    const e = createTaskEngine()
+    const T0 = 1000000
+    e.observe([{ key: 's1', title: '会话 A', subagents: 2, toolCalls: 3, phase: 'bash' }], T0)
+    if (e.summary(T0).running !== 1) fail('应该记录 1 个在跑的任务')
+    if (e.view(T0)[0].elapsed !== '0:00') fail('刚出现时用时应是 0:00')
+    // 30 秒后再看，还是同一个任务 → 仍在跑、用时 0:30
+    e.observe([{ key: 's1', title: '会话 A', subagents: 2, toolCalls: 5, phase: 'code' }], T0 + 30000)
+    const v = e.view(T0 + 30000)[0]
+    if (!v.running) fail('还在跑的不该被标成结束')
+    if (v.elapsed !== '0:30') fail('应该从首次看见开始算，即 0:30，实得 ' + v.elapsed)
+    if (v.toolCalls !== 5) fail('工具调用数应跟着最新读数更新')
+    if (v.phase !== 'code') fail('当前阶段应跟着更新')
+  }
+  ok('任务监控：宿主只报"在跑"，用时由插件自己从首次看见起算（30 秒后 = 0:30）')
+
+  // ③ 消失了 = 刚跑完；过一段时间清掉
+  {
+    const e = createTaskEngine()
+    const T0 = 2000000
+    e.observe([{ key: 's1' }, { key: 's2' }], T0)
+    e.observe([{ key: 's1' }], T0 + 10000)          // s2 结束
+    const rows = e.view(T0 + 10000)
+    const s2 = rows.find((r) => r.key === 's2')
+    if (!s2) fail('刚结束的任务应还留在列表里（让人看见"刚跑完"）')
+    if (s2.running) fail('结束的任务不该还标成在跑')
+    if (!/刚跑完/.test(s2.doneText)) fail('结束行应写"刚跑完"，实得 ' + s2.doneText)
+    if (e.summary(T0 + 10000).running !== 1) fail('在跑的应只剩 1 个')
+    // 熬过保留时间 → 清掉
+    e.observe([{ key: 's1' }], T0 + 10000 + TASKS.KEEP_DONE_MS + 5000)
+    if (e.view(T0 + 10000 + TASKS.KEEP_DONE_MS + 5000).some((r) => r.key === 's2')) {
+      fail('结束超过保留时间的行应被清掉')
+    }
+  }
+  ok('任务监控：任务消失即标"刚跑完"并短暂保留，超过 ' + Math.round(TASKS.KEEP_DONE_MS / 1000) + ' 秒清掉')
+
+  // ④ 抖动（闪一下又回来）不许重置计时；真的重跑才重置
+  {
+    const e = createTaskEngine()
+    const T0 = 3000000
+    e.observe([{ key: 's1' }], T0)
+    e.observe([], T0 + 2000)                          // 闪没了
+    e.observe([{ key: 's1' }], T0 + 3000)             // 又出现，间隔 < REGRACE_MS
+    if (e.view(T0 + 3000)[0].elapsed !== '0:03') fail('抖动不该重置计时，实得 ' + e.view(T0 + 3000)[0].elapsed)
+    e.observe([], T0 + 4000)
+    e.observe([{ key: 's1' }], T0 + 4000 + TASKS.REGRACE_MS + 1000)   // 隔了很久才又出现
+    if (e.view(T0 + 4000 + TASKS.REGRACE_MS + 1000)[0].elapsed !== '0:00') {
+      fail('隔久了再出现应算新的一轮（计时归零）')
+    }
+  }
+  ok('任务监控：界面抖动不重置计时；隔久了再跑才算新的一轮')
+
+  // ⑤ 汇总、行数上限、存档不还原"在跑"状态
+  {
+    const e = createTaskEngine()
+    const T0 = 4000000
+    const many = []
+    for (let i = 0; i < 20; i++) many.push({ key: 'k' + i, subagents: 1, toolCalls: 2 })
+    e.observe(many, T0)
+    if (e.view(T0).length !== TASKS.MAX_ROWS) fail('行数应封顶在 ' + TASKS.MAX_ROWS)
+    const sum = e.summary(T0)
+    if (sum.scheduled !== 0) fail('默认没有计划任务')
+    const sv = e.serialize()
+    const e2 = createTaskEngine()
+    if (!e2.restore(sv)) fail('自己的存档应能读回')
+    if (e2.view(T0).some((r) => r.running)) fail('读回来的都不该标成"在跑"（重启后状态已不准）')
+    if (e2.view(T0).length !== Math.min(20, TASKS.MAX_ROWS)) fail('存档行数应保持一致')
+    if (e2.restore('nope')) fail('坏存档应被拒绝')
+    if (e2.restore({ a: 1 })) fail('非数组应被拒绝')
+  }
+  ok('任务监控：汇总正确、行数封顶 ' + TASKS.MAX_ROWS + '、存档读回后不假装还在跑')
+
+  // ⑥ ★ 用户明确要求：后台跑完**不提醒**。静态审计：这个区域不许出现提醒音的任何入口。
+  {
+    const a2 = src.indexOf('/* TASK-ENGINE:BEGIN */')
+    const b2 = src.indexOf('/* TASK-ENGINE:END */')
+    const region = src.slice(a2, b2)
+    const banned = [/playCough/, /createNotifier/, /notifyNote/, /toggleNotify/, /NOTIFY_KEY/, /setNotify/, /poolSfx/]
+    for (const re of banned) {
+      if (re.test(region)) fail('任务监控不许碰提醒音（命中 ' + re + '）')
+    }
+  }
+  ok('任务监控：静态审计通过 —— 区域里没有任何提醒音入口（跑完不提醒）')
+}
+
+
+  // 任务浮窗：按 store.taskOpen 决定渲染与否（关着时返回 null）
+  const instTask = (extra) => {
+    const inj = regs.get('im2005-tasks').opts.inject()
+    return instantiate(regs.get('im2005-tasks').comp, Object.assign({}, inj, extra || {}))
+  }
+
+console.log('\n=== 19. 后台任务浮窗：点开才看 / 列出正在跑的任务 ===')
+{
+  const baseInj = regs.get('im2005-tasks').opts.inject()
+  const TV = baseInj.view
+  const toolBtn5 = (label) => walk(instantiate(regs.get('im2005-toolbar').comp), [])
+    .find((x) => x.type === 'button' && JSON.stringify(x.children || '').includes(label))
+  const nOf = (n, out, d) => {
+    const dd = d || 0
+    if (!n || typeof n !== 'object' || dd > 12) return out
+    if (typeof n.type === 'function') { try { return nOf(instantiate(n.type, n.props), out, dd + 1) } catch (e) { return out } }
+    out.push(n)
+    ;(n.children || []).forEach((c) => nOf(c, out, dd + 1))
+    return out
+  }
+  const txt = (n) => {
+    if (n === null || n === undefined || n === false) return ''
+    if (typeof n === 'string' || typeof n === 'number') return String(n)
+    if (Array.isArray(n)) return n.map(txt).join(' ')
+    if (typeof n.type === 'function') { try { return txt(instantiate(n.type, n.props)) } catch (e) { return '' } }
+    let o = ''
+    ;(n.children || []).forEach((c) => { o += ' ' + txt(c) })
+    return o
+  }
+
+  // 关着的时候不渲染任何东西（用户要求：不点就看不到）
+  if (nOf(instTask(), [], 0).length) fail('没点按钮前不该渲染任何节点')
+  toolBtn5('后台任务').props.onClick()
+  const tree = nOf(instTask(), [], 0)
+  if (!tree.length) fail('点了「后台任务」按钮后应该出现浮窗')
+  const box = tree.find((n) => n.props && n.props.className === 'dsh-skin-im2005-task')
+  if (!box) fail('找不到浮窗容器')
+  if (!(box.props.style.zIndex > 2000000000)) fail('层级应压过普通界面（实得 ' + box.props.style.zIndex + '）')
+  if (!/现在没有在跑的任务/.test(txt(instTask()))) {
+    fail('没有任务时应明说"现在没有在跑的任务"，实得 ' + JSON.stringify(txt(instTask()).slice(0, 120)))
+  }
+  if (!/跑完不会响/.test(txt(instTask()))) fail('提示里应写明跑完不响（用户要求）')
+  if (!/在跑 0/.test(txt(instTask()))) fail('HUD 应显示在跑 0')
+  ok('后台任务：不点不渲染；点开显示"现在没有在跑的任务"，并写明跑完不提醒')
+
+  // 有任务在跑：读到的数据要进列表
+  {
+    const fakeItems = [{ key: 'k1', title: '会话 A', subagents: 2, toolCalls: 7, scheduled: 1, phase: 'bash' }]
+    // 走用户路径：点 HUD 上那个 ↻ 刷新（夹具不重放 effect 里的 setState，所以不靠它）
+    const rf = nOf(instTask({ scan: () => fakeItems }), [], 0).find((n) => n.type === 'button' && txt(n).trim() === '↻')
+    if (!rf) fail('HUD 里应有刷新按钮 ↻')
+    rf.props.onClick()
+    const t2 = nOf(instTask({ scan: () => fakeItems }), [], 0)
+    const row = t2.find((n) => n.props && n.props.className === 'dsh-skin-im2005-task-row')
+    if (!row) fail('有任务时应出现一行')
+    const all = txt(instTask({ scan: () => fakeItems }))
+    if (!/会话 A/.test(all)) fail('行里应显示会话名，实得 ' + JSON.stringify(all.slice(0, 140)))
+    if (!/子代理 2/.test(all)) fail('应显示子代理数')
+    if (!/工具 7/.test(all)) fail('应显示工具调用数')
+    if (!/计划 1/.test(all)) fail('应显示计划任务数')
+    if (!/在跑 1/.test(all)) fail('HUD 应显示在跑 1')
+    if (!/bash/.test(all)) fail('应显示当前阶段')
+  }
+  ok('后台任务：把读到的在跑任务列出来（会话名/子代理/工具调用/计划任务/当前阶段）')
+
+  // 关窗 → 清空渲染、开关落盘
+  {
+    const t3 = nOf(instTask(), [], 0)
+    t3.find((n) => n.type === 'button' && txt(n).trim() === '✕').props.onClick()
+    if (nOf(instTask(), [], 0).length) fail('关掉后不该还渲染（用户要求：不点就看不到）')
+    if (lsData.get('dsh-skin-im2005.taskopen') !== '0') fail('开关应落盘')
+  }
+  ok('后台任务：关掉即不渲染，开关落盘')
 }
 
 console.log('\nALL CHECKS PASSED ✓')

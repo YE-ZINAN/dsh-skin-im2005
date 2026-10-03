@@ -1721,6 +1721,139 @@ window.__ModuleLoader__.load({
     }
     /* FARM-STORE:END */
 
+    /* TASK-STORE:BEGIN */
+    const TASK_KEY = 'dsh-skin-im2005.tasks'
+    const TASK_OPEN_KEY = 'dsh-skin-im2005.taskopen'
+    const readTaskSave = () => { try { const r = window.localStorage.getItem(TASK_KEY); return r ? JSON.parse(r) : null } catch (e) { return null } }
+    const writeTaskSave = (o) => { try { window.localStorage.setItem(TASK_KEY, JSON.stringify(o)) } catch (e) {} }
+    const readTaskOpen = () => { try { return window.localStorage.getItem(TASK_OPEN_KEY) === '1' } catch (e) { return false } }
+    const writeTaskOpen = (on) => { try { window.localStorage.setItem(TASK_OPEN_KEY, on ? '1' : '0') } catch (e) {} }
+    /* TASK-STORE:END */
+
+    /* ================================================================== *
+     * 后台任务监控 —— 引擎（纯逻辑，不碰 DOM）
+     *
+     * 用户定的规矩（2026-10-03）：**纯被动**。点按钮才开窗看，平时界面上没有任何标记；
+     * **跑完不咳嗽** —— 这个功能不许碰提醒音（用第 18 节静态审计钉死）。
+     *
+     * 为什么引擎要单独写：宿主只在 DOM 上告诉你"谁现在在跑"，**不给开始时间**。
+     * 所以"已经跑了多久"必须由插件自己记 —— 第一次看见它跑就开始计时。
+     * 这段记忆逻辑正是最容易错的地方（漏记、重复记、跑完了还留着），必须能断言。
+     * ================================================================== */
+    /* TASK-ENGINE:BEGIN */
+    const TASKS = {
+      MAX_ROWS: 12,          // 面板最多显示多少行
+      KEEP_DONE_MS: 45000,   // 跑完之后还留 45 秒（让你看见"刚跑完"），过后清掉
+      REGRACE_MS: 10000,     // 消失又出现，且间隔小于这个时间 → 认作同一次（不重置计时）
+      STALE_MS: 60000,       // 超过这么久没再看见，就当它早就结束了（防止计时器飘）
+    }
+    /** 把毫秒格式化成 1:23 / 1:02:03 */
+    const taskClock = (ms) => {
+      const s0 = Math.max(0, Math.floor((Number(ms) || 0) / 1000))
+      const h = Math.floor(s0 / 3600)
+      const m = Math.floor((s0 % 3600) / 60)
+      const s = s0 % 60
+      const two = (n) => (n < 10 ? '0' + n : String(n))
+      return h > 0 ? h + ':' + two(m) + ':' + two(s) : m + ':' + two(s)
+    }
+    const createTaskEngine = () => {
+      let rows = []
+      const byKey = () => {
+        const m = new Map()
+        for (const r of rows) m.set(r.key, r)
+        return m
+      }
+      return {
+        TASKS,
+        clock: taskClock,
+        /**
+         * 把这一轮"看见的正在跑的列表"并进来。
+         * @param seen [{ key, title, subagents, toolCalls, phase, scheduled }]
+         * @param now  当前时间
+         */
+        observe: (seen, now) => {
+          const list = Array.isArray(seen) ? seen : []
+          const m = byKey()
+          const seenKeys = new Set()
+          for (const s of list) {
+            if (!s || typeof s.key !== 'string' || !s.key) continue
+            seenKeys.add(s.key)
+            const old = m.get(s.key)
+            if (!old) {
+              rows.push({
+                key: s.key, title: String(s.title || s.key).slice(0, 60),
+                startedAt: now, lastSeenAt: now, running: true,
+                subagents: Number(s.subagents) || 0, toolCalls: Number(s.toolCalls) || 0,
+                phase: s.phase ? String(s.phase).slice(0, 12) : '',
+                scheduled: Number(s.scheduled) || 0,
+              })
+            } else {
+              // 已经结束过的又出现了：间隔短就当同一次，接着算；否则算新的一轮
+              if (!old.running && now - old.lastSeenAt > TASKS.REGRACE_MS) old.startedAt = now
+              old.running = true
+              old.lastSeenAt = now
+              old.title = String(s.title || old.title).slice(0, 60)
+              old.subagents = Number(s.subagents) || 0
+              old.toolCalls = Number(s.toolCalls) || 0
+              old.phase = s.phase ? String(s.phase).slice(0, 12) : ''
+              old.scheduled = Number(s.scheduled) || 0
+            }
+          }
+          for (const r of rows) {
+            if (r.running && !seenKeys.has(r.key)) {
+              r.running = false
+              r.endedAt = now
+            }
+          }
+          // 清掉"结束很久"和"很久没再看见"的
+          rows = rows.filter((r) => {
+            const t = r.running ? r.lastSeenAt : (r.endedAt || r.lastSeenAt)
+            return now - t <= (r.running ? TASKS.STALE_MS : TASKS.KEEP_DONE_MS) && now >= r.lastSeenAt - 1000
+          })
+          // 最新的在前，但正在跑的一律排在最上面
+          rows.sort((a, b) => (a.running === b.running ? b.startedAt - a.startedAt : (a.running ? -1 : 1)))
+          if (rows.length > TASKS.MAX_ROWS) rows = rows.slice(0, TASKS.MAX_ROWS)
+          return rows.length
+        },
+        /** 面板要显示的行：带上"跑了多久" */
+        view: (now) => rows.map((r) => ({
+          key: r.key, title: r.title, running: r.running,
+          elapsed: taskClock(now - r.startedAt),
+          elapsedMs: now - r.startedAt,
+          subagents: r.subagents, toolCalls: r.toolCalls,
+          phase: r.phase, scheduled: r.scheduled,
+          doneText: '刚跑完 · 用了 ' + taskClock((r.endedAt || r.lastSeenAt) - r.startedAt),
+        })),
+        summary: (now) => {
+          const running = rows.filter((r) => r.running)
+          return {
+            running: running.length,
+            rows: rows.length,
+            subagents: running.reduce((a, r) => a + r.subagents, 0),
+            toolCalls: running.reduce((a, r) => a + r.toolCalls, 0),
+            scheduled: running.reduce((a, r) => a + r.scheduled, 0),
+            longest: running.length ? taskClock(now - Math.min.apply(null, running.map((r) => r.startedAt))) : '0:00',
+          }
+        },
+        reset: () => { rows = [] },
+        serialize: () => rows.map((r) => ({ ...r })),
+        restore: (src) => {
+          if (!Array.isArray(src)) return false
+          rows = src.filter((r) => r && typeof r.key === 'string' && Number.isFinite(Number(r.startedAt)))
+            .slice(0, TASKS.MAX_ROWS)
+            .map((r) => ({
+              key: r.key, title: String(r.title || r.key).slice(0, 60),
+              startedAt: Number(r.startedAt), lastSeenAt: Number(r.lastSeenAt) || Number(r.startedAt),
+              running: false,                      // 读回来的都当"不在跑"（重启过，状态已经不准了）
+              subagents: Number(r.subagents) || 0, toolCalls: Number(r.toolCalls) || 0,
+              phase: String(r.phase || '').slice(0, 12), scheduled: Number(r.scheduled) || 0,
+            }))
+          return true
+        },
+      }
+    }
+    /* TASK-ENGINE:END */
+
     /* GAME-STORE:BEGIN */
     const POOL_SAVE_KEY = 'dsh-skin-im2005.pool'
     const POOL_POS_KEY = 'dsh-skin-im2005.poolpos'
@@ -1815,6 +1948,7 @@ window.__ModuleLoader__.load({
       // Token农场
       farmOpen: false,
       farmNote: '',
+      taskOpen: false,
       farmSfx: false,
       /* GAME-UI-STORE:END */
       balance: { open: false, state: 'idle', amount: '', note: '' },
@@ -2285,6 +2419,16 @@ window.__ModuleLoader__.load({
               const on = !s.farmOpen
               store.set({ farmOpen: on, farmNote: '' })
               writeFarmOpen(on)
+            } catch (err) {}
+          }),
+        // 后台任务监控：**纯被动** —— 点按钮才开窗，平时界面上没有任何标记，跑完也不提醒
+        btn('tasks', '后台任务',
+          '后台任务：点开才看，列出正在跑的会话（用时/子代理/工具调用/计划任务）。平时不显示任何标记，跑完也不会响。',
+          () => {
+            try {
+              const on = !s.taskOpen
+              store.set({ taskOpen: on })
+              writeTaskOpen(on)
             } catch (err) {}
           }),
         /* GAME-BUTTON:END */
@@ -3508,6 +3652,233 @@ window.__ModuleLoader__.load({
       }, rows)
     }
     /* GAME-VIEW:END */
+
+
+    /* ================================================================== *
+     * 后台任务监控浮窗
+     *
+     * 用户定的规矩：**纯被动**，点按钮才开窗；平时界面上没有任何标记（不点红点、不加角标）；
+     * **跑完不咳嗽**（不碰提醒音，第 18 节静态审计钉死）。
+     *
+     * 数据来源是宿主自己画在界面上的标记（我们只读不写）：
+     *   [data-conversation-session] 里含 [data-chat-running]  → 这个会话在跑
+     *   [data-turn-process-subagents] / [data-turn-process-tool-calls]  → 子代理数 / 工具调用数
+     *   [data-session-schedule-task]  → 挂了计划任务
+     * 这些是宿主内部实现，升级可能改名 —— 所以一律"读不到就当没有"，绝不报错。
+     * 只有窗口开着的时候才刷新（关掉就停），不做后台轮询。
+     * ================================================================== */
+    /* TASK-VIEW:BEGIN */
+    const TASK_VIEW = { w: 340, pad: 7, rowH: 34, maxRows: 12, titleH: 30, hudH: 26, tipH: 34 }
+    TASK_VIEW.winW = TASK_VIEW.w + 2
+    TASK_VIEW.listH = TASK_VIEW.rowH * 6
+    TASK_VIEW.winH = TASK_VIEW.titleH + TASK_VIEW.hudH + TASK_VIEW.listH + TASK_VIEW.tipH
+    let TASK_ENG = null
+    const taskDigits = (t) => {
+      const m = String(t == null ? '' : t).match(/(\d+)/)
+      return m ? Math.max(0, parseInt(m[1], 10)) : 0
+    }
+    /** 只读地扫一遍宿主界面，返回"正在跑的任务"列表。任何一步失败都当没有。 */
+    const taskScan = () => {
+      const out = []
+      try {
+        if (typeof document === 'undefined' || !document.querySelectorAll) return out
+        const hosts = document.querySelectorAll('[data-conversation-session]')
+        for (let i = 0; i < hosts.length; i++) {
+          const el = hosts[i]
+          let running = false
+          try { running = !!(el.querySelector && el.querySelector('[data-chat-running]')) } catch (err) { running = false }
+          if (!running) continue
+          let title = ''
+          try {
+            const tEl = el.querySelector('[data-session-title]') || el
+            title = String(tEl.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)
+          } catch (err) { title = '' }
+          const pick = (sel) => { try { return el.querySelector(sel) } catch (err) { return null } }
+          const subEl = pick('[data-turn-process-subagents]')
+          const toolEl = pick('[data-turn-process-tool-calls]')
+          const schedEls = (() => { try { return el.querySelectorAll('[data-session-schedule-task],[data-session-schedule-tasks]') } catch (err) { return [] } })()
+          let phase = ''
+          try {
+            const pEl = pick('[data-process-activity]')
+            if (pEl) phase = String(pEl.getAttribute('data-process-activity') || pEl.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 10)
+          } catch (err) { phase = '' }
+          out.push({
+            key: 'task-' + i + '-' + (title || 'session'),
+            title: title || '未命名会话',
+            subagents: taskDigits(subEl && subEl.textContent),
+            toolCalls: taskDigits(toolEl && toolEl.textContent),
+            scheduled: schedEls ? schedEls.length : 0,
+            phase,
+          })
+        }
+      } catch (err) { return out }
+      return out
+    }
+    const ImTaskWindow = (props) => {
+      const s = useStore()
+      const posStore = props.pos || { read: readFarmPos, write: writeFarmPos }
+      const openStore = props.openFlag || { read: readTaskOpen, write: writeTaskOpen }
+      const scan = (props.scan) || taskScan
+      const boot = React.useRef(null)
+      const dragWin = React.useRef(null)
+      const mounted = React.useRef(true)
+      const [min, setMin] = React.useState(false)
+      const [rows, setRows] = React.useState([])
+      const [err, setErr] = React.useState('')
+      if (!boot.current) {
+        if (!TASK_ENG) { TASK_ENG = createTaskEngine(); const sv = readTaskSave(); if (sv) TASK_ENG.restore(sv) }
+        boot.current = { eng: TASK_ENG }
+      }
+      const eng = boot.current.eng
+      const winW = TASK_VIEW.winW
+      const winH = min ? TASK_VIEW.titleH : TASK_VIEW.winH
+      const clampPos = (x, y, hgt) => {
+        const vw = globalThis.innerWidth || 1200
+        const vh = globalThis.innerHeight || 800
+        const H = hgt || winH
+        return { x: Math.max(0, Math.min(Math.max(0, vw - winW), x)), y: Math.max(0, Math.min(Math.max(0, vh - H), y)) }
+      }
+      const defaultPos = () => clampPos((globalThis.innerWidth || 1200) - winW - 40, 180)
+      const [pos, setPos] = React.useState(() => {
+        const p0 = posStore.read() || defaultPos()
+        return clampPos(p0.x, p0.y)
+      })
+      const refresh = () => {
+        const now = Date.now()
+        let seen = []
+        try { seen = scan() || [] } catch (e) { seen = [] }
+        eng.observe(seen, now)
+        setRows(eng.view(now))
+        try { writeTaskSave(eng.serialize()) } catch (e) {}
+      }
+      React.useEffect(() => () => { mounted.current = false }, [])
+      // 只在窗口开着的时候刷新；关掉即停，不做后台轮询
+      React.useEffect(() => {
+        if (!s.taskOpen) return undefined
+        refresh()
+        const id = setInterval(() => { if (mounted.current) refresh() }, 1000)
+        const fix = () => setPos((cur) => clampPos(cur.x, cur.y))
+        if (typeof globalThis.addEventListener === 'function') globalThis.addEventListener('resize', fix)
+        return () => {
+          try { clearInterval(id) } catch (e) {}
+          try { if (typeof globalThis.removeEventListener === 'function') globalThis.removeEventListener('resize', fix) } catch (e) {}
+        }
+      }, [s.taskOpen])
+      const onTitleDown = (ev) => {
+        const t = ev && ev.target
+        if (t && typeof t.closest === 'function' && t.closest('button,[data-nodrag]')) return
+        dragWin.current = { dx: ev.clientX - pos.x, dy: ev.clientY - pos.y }
+        if (ev && ev.currentTarget && typeof ev.currentTarget.setPointerCapture === 'function' && ev.pointerId !== undefined) {
+          try { ev.currentTarget.setPointerCapture(ev.pointerId) } catch (e) {}
+        }
+      }
+      const onTitleMove = (ev) => {
+        if (!dragWin.current) return
+        setPos(clampPos(ev.clientX - dragWin.current.dx, ev.clientY - dragWin.current.dy))
+      }
+      const onTitleUp = () => {
+        if (!dragWin.current) return
+        dragWin.current = null
+        setPos((cur) => { const f = clampPos(cur.x, cur.y); try { posStore.write(f) } catch (e) {}; return f })
+      }
+      const onTitleDouble = () => { const d = defaultPos(); setPos(d); try { posStore.write(d) } catch (e) {} }
+      if (!s.taskOpen) return null
+      const face = faceOf(s.scheme)
+      const now = Date.now()
+      const sum = eng.summary(now)
+      const btnStyle = {
+        border: '1px solid ' + IM_EDGE, background: 'linear-gradient(#ffffff,#e6eef8)', color: '#1a1a1a',
+        font: '11px/1.5 SimSun, serif', padding: '2px 8px', cursor: 'pointer', pointerEvents: 'auto',
+      }
+      const rws = []
+      for (let i = 0; i < 6; i++) {
+        const r = rows[i]
+        if (!r) { rws.push(h('div', { key: 'e' + i, style: { height: TASK_VIEW.rowH } })); continue }
+        rws.push(h('div', {
+          key: r.key, className: 'dsh-skin-im2005-task-row', 'data-running': r.running ? '1' : '0',
+          style: {
+            height: TASK_VIEW.rowH, boxSizing: 'border-box', padding: '2px 7px',
+            borderBottom: '1px dotted ' + IM_EDGE, font: '11px/1.5 SimSun, serif',
+            color: r.running ? '#123' : '#777', pointerEvents: 'auto',
+          },
+        }, [
+          h('div', { key: 't', style: { display: 'flex', gap: 6, alignItems: 'center' } }, [
+            h('span', { key: 'd', style: { color: r.running ? '#2f8f2f' : '#aaa' } }, r.running ? '●' : '○'),
+            h('span', { key: 'n', style: { flex: '1 1 auto', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' } }, r.title),
+            h('span', { key: 'c', style: { flexShrink: 0, color: r.running ? '#1f6fb2' : '#999' } }, r.running ? r.elapsed : r.doneText),
+          ]),
+          h('div', { key: 'm', style: { color: '#666', whiteSpace: 'nowrap', overflow: 'hidden' } },
+            r.running
+              ? ('子代理 ' + r.subagents + ' · 工具 ' + r.toolCalls + (r.phase ? ' · ' + r.phase : '') + (r.scheduled ? ' · 计划 ' + r.scheduled : ''))
+              : r.doneText),
+        ]))
+      }
+      const rows_out = []
+      rows_out.push(h('div', {
+        key: 'title',
+        onPointerDown: onTitleDown, onPointerMove: onTitleMove, onPointerUp: onTitleUp, onDoubleClick: onTitleDouble,
+        title: '拖动移动；双击回到默认位置（窗口只能留在应用窗口内）',
+        style: {
+          display: 'flex', alignItems: 'center', gap: 6, padding: '0 4px 0 7px', cursor: 'move',
+          height: TASK_VIEW.titleH, boxSizing: 'border-box', overflow: 'hidden',
+          background: IM_BLUE, color: '#fff', font: 'bold 12px/1.6 SimSun, serif',
+          borderTopLeftRadius: 3, borderTopRightRadius: 3, pointerEvents: 'auto',
+        },
+      }, [
+        h('span', { key: 't', style: { flex: '1 1 auto' } }, '后台任务'),
+        h('button', {
+          key: 'min', type: 'button', title: min ? '展开' : '收起成一条标题栏',
+          onClick: () => setMin(!min),
+          style: { ...btnStyle, background: 'rgba(255,255,255,0.18)', color: '#fff', border: '1px solid rgba(255,255,255,0.45)', padding: '0 6px' },
+        }, min ? '▣' : '─'),
+        h('button', {
+          key: 'x', type: 'button', title: '关闭（这个窗口平时不显示任何东西，点按钮才开）',
+          onClick: () => { try { writeTaskSave(eng.serialize()) } catch (e) {}; try { openStore.write(false) } catch (e) {}; store.set({ taskOpen: false }) },
+          style: { ...btnStyle, background: 'rgba(255,255,255,0.18)', color: '#fff', border: '1px solid rgba(255,255,255,0.45)', padding: '0 6px' },
+        }, '✕'),
+      ]))
+      if (!min) {
+        rows_out.push(h('div', {
+          key: 'hud', className: 'dsh-skin-im2005-task-hud',
+          style: {
+            display: 'flex', gap: 8, alignItems: 'center', padding: '0 7px',
+            background: '#eef3fb', borderBottom: '1px solid ' + IM_EDGE,
+            font: '11px/1.5 SimSun, serif', color: '#1a1a1a', height: TASK_VIEW.hudH, boxSizing: 'border-box',
+            whiteSpace: 'nowrap', overflow: 'hidden',
+          },
+        }, [
+          h('span', { key: 'a', style: { fontWeight: 'bold', color: sum.running ? '#2f8f2f' : '#666' } }, '在跑 ' + sum.running),
+          h('span', { key: 'b' }, '子代理 ' + sum.subagents),
+          h('span', { key: 'c' }, '工具 ' + sum.toolCalls),
+          h('span', { key: 'd' }, '计划 ' + sum.scheduled),
+          h('span', { key: 'e', style: { flex: '1 1 auto' } }),
+          h('button', {
+            key: 'r', type: 'button', style: { ...btnStyle, flexShrink: 0 }, title: '立刻刷新一次',
+            onClick: () => refresh(),
+          }, '↻'),
+        ]))
+        rows_out.push(h('div', { key: 'list', style: { background: face, pointerEvents: 'none' } }, rws))
+        rows_out.push(h('div', {
+          key: 'tip', className: 'dsh-skin-im2005-task-tip',
+          style: {
+            padding: '3px 7px 4px', background: '#eef3fb', borderTop: '1px solid ' + IM_EDGE,
+            font: '11px/1.6 SimSun, serif', color: '#333', height: TASK_VIEW.tipH, boxSizing: 'border-box', overflow: 'hidden',
+          },
+        }, [
+          h('div', { key: 'a' }, rows.length ? '最长 ' + sum.longest + ' · 只有打开这个窗口时才刷新' : '现在没有在跑的任务'),
+          h('div', { key: 'b', style: { color: '#666' } }, '跑完不会响、不会有提示 —— 想看就点按钮'),
+        ]))
+      }
+      return h('div', {
+        className: 'dsh-skin-im2005-task',
+        style: {
+          position: 'fixed', left: pos.x, top: pos.y, width: winW,
+          background: face, border: '1px solid ' + IM_EDGE_STRONG, boxShadow: '2px 3px 10px rgba(0,0,0,0.35)',
+          zIndex: POOL_VIEW.z, pointerEvents: 'none', borderRadius: 4,
+        },
+      }, rows_out)
+    }
+    /* TASK-VIEW:END */
 
     /* NOTE-VIEW:BEGIN */
     const NOTE_VIEW = { w: 340, pad: 7, taH: 176, titleH: 28, footH: 24 }
@@ -4802,7 +5173,7 @@ window.__ModuleLoader__.load({
         store.set({ mineLevel: readMineLevel() })
         // 备注框：开关也读盘 —— 上次开着就还开着
         store.set({ noteOpen: readNoteOpen() })
-        store.set({ farmOpen: readFarmOpen(), farmSfx: readFarmSfx() })
+        store.set({ farmOpen: readFarmOpen(), farmSfx: readFarmSfx(), taskOpen: readTaskOpen() })
         store.setFarmSfx = (on) => {
           const x = on === true
           store.set({ farmSfx: x })
@@ -5075,6 +5446,17 @@ window.__ModuleLoader__.load({
               openFlag: { read: readFarmOpen, write: writeFarmOpen },
               sfxPref: { read: readFarmSfx, write: writeFarmSfx },
               view: FARM_VIEW,
+            }),
+          }],
+          // 后台任务监控（浮层）。纯只读：扫宿主界面上的标记，读不到就当没有。
+          ['shell.overlay', 'im2005-tasks', ImTaskWindow, {
+            inject: () => ({
+              engine: { create: createTaskEngine, TASKS },
+              scan: taskScan,
+              save: { read: readTaskSave, write: writeTaskSave },
+              pos: { read: readFarmPos, write: writeFarmPos },
+              openFlag: { read: readTaskOpen, write: writeTaskOpen },
+              view: TASK_VIEW,
             }),
           }],
           // 跨会话备注框（浮层）。内容/位置/开关都走 inject，测试拿到同一条路径。
