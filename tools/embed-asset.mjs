@@ -5,7 +5,7 @@
 // artwork is inlined and the plugin stays fully self-contained.
 //
 // Re-run after replacing any asset:
-//   node dsh-skin-qq2005/tools/embed-asset.mjs
+//   node dsh-skin-im2005/tools/embed-asset.mjs
 //
 // Every asset is optional: a missing file yields an empty const, and the client
 // falls back to its built-in original SVG artwork, so the skin never renders blank.
@@ -19,9 +19,9 @@ const BEGIN = '/* ASSET:BEGIN */'
 const END = '/* ASSET:END */'
 
 const ASSETS = [
-  { file: 'qqshow.jpg', name: 'QQSHOW_SRC', label: 'QQ秀 立绘' },
-  { file: 'penguin.png', name: 'PENGUIN_SRC', label: '企鹅图标' },
-  { file: 'avatar.png', name: 'AVATAR_SRC', label: '侧栏头像' },
+  { file: 'my-show.jpg', name: 'SHOW_SRC', label: '形象秀 立绘', fallback: '使用内置原创 SVG 兜底' },
+  { file: 'mascot.png', name: 'PENGUIN_SRC', label: '企鹅图标', fallback: '使用内置原创 SVG 兜底' },
+  { file: 'avatar.png', name: 'AVATAR_SRC', label: '侧栏头像', fallback: '使用内置原创 SVG 兜底' },
 ]
 
 const mimeOf = (buf) => {
@@ -29,6 +29,11 @@ const mimeOf = (buf) => {
   if (buf.slice(0, 8).toString('hex') === '89504e470d0a1a0a') return 'image/png'
   if (buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WEBP') return 'image/webp'
   if (buf.slice(0, 6).toString('ascii').startsWith('GIF8')) return 'image/gif'
+  // 音频：ID3 标签 或 MPEG 帧同步字 —— 必须给对 MIME，否则 <audio> 不肯播
+  if (buf.slice(0, 3).toString('ascii') === 'ID3') return 'audio/mpeg'
+  if (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0) return 'audio/mpeg'
+  if (buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WAVE') return 'audio/wav'
+  if (buf.slice(0, 4).toString('ascii') === 'OggS') return 'audio/ogg'
   return 'application/octet-stream'
 }
 
@@ -39,7 +44,7 @@ const report = []
 for (const a of ASSETS) {
   const p = path.join(ROOT, 'assets', a.file)
   if (!fs.existsSync(p)) {
-    lines.push('    // ' + a.file + ' 缺失 —— 使用内置原创 SVG 兜底')
+    lines.push('    // ' + a.file + ' 缺失 —— ' + (a.fallback || '使用内置原创兜底'))
     lines.push("    const " + a.name + " = ''")
     report.push('  ' + a.file.padEnd(14) + 'MISSING -> ' + a.name + " = ''（走 SVG 兜底）")
     continue

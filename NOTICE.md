@@ -40,9 +40,9 @@
 
 ## 如果你要加入自己的图片
 
-`tools/embed-asset.mjs` 支持把 `assets/` 下的三张图（`qqshow.jpg` / `penguin.png` / `avatar.png`）内联进 `client.js`。
+`tools/embed-asset.mjs` 支持把 `assets/` 下的文件（`my-show.jpg` / `mascot.png` / `avatar.png`）内联进 `client.js`。不提供任何文件时，图片走内置的原创 SVG。
 
-**这是给你自己用的**。请确保你拥有所用图片的权利 —— 把别人的美术资源打包分发可能构成侵权，与本项目无关。
+**这是给你自己用的**。请确保你拥有所用素材的权利 —— 把别人的美术资源打包分发可能构成侵权，与本项目无关。
 
 ## 权利人联系
 
