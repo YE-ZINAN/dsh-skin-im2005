@@ -160,6 +160,7 @@ tools/self-test.mjs   # 离线回归测试，不需要启动客户端
 ## 更新日志
 
 ### v1.13.0
+<img width="2214" height="1328" alt="ScreenShot_2026-10-03_143111_866" src="https://github.com/user-attachments/assets/10bf8290-8a0c-4e98-aef6-1ca08627eaae" />
 
 **修复**
 - 美式八球：打开窗口时画布可能是空白的 —— 改为"渲染即同步画布 + 50ms 兜底重绘"。
