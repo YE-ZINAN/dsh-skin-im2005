@@ -20,7 +20,8 @@
 | 形象秀 右侧列 | 三段可折叠面板：`好友形象` / `个人空间` / `我的形象`；展开时自动让位，**不遮挡**主会话 |
 | 皮肤档位 | 三档：**关 / 标准 / 浓烈**，随时切换、实时生效 |
 
-> 📸 **截图**：把你的界面截图放到这里（`docs/screenshot.png`），推广时效果最好。
+> 📸 **截图**：<img width="2170" height="1544" alt="e03ff1de-bdce-4e6a-8dde-8bf7d636b9fe" src="https://github.com/user-attachments/assets/a62e00c3-c385-4ea0-b9c5-918ad1c113dd" />
+
 
 ---
 
