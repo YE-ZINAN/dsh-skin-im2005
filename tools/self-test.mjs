@@ -1358,6 +1358,27 @@ console.log('\n=== 10. 美式八球引擎：物理 + 规则 + 存档 ===')
   if (w3.state().winner !== 1) fail('提前打进 8 号应判负，实得 winner=' + w3.state().winner)
   ok('提前打进 8 号球 → 判负')
 
+  // ⑩b **打进自己组的最后一颗 = 继续出杆，下一杆才轮到打 8 号**（用户实测报的 bug）
+  //     原实现把"该打 8 号了吗"按**击球后**的台面算 —— 这一杆正好把自己最后一颗打进，
+  //     于是被判成"该打 8 号却先碰到了别的球"= 犯规 → 回合白送对手；
+  //     用户那边看到的是"打进最后一颗 → 轮到电脑 → 电脑立刻出杆"，而且提示行在电脑回合
+  //     显示的是"电脑在想…"，犯规原因根本看不见，所以只能描述成"没有报犯规"。
+  {
+    const last = layout({ 0: [50, 14], 3: [50, 11], 8: [90, 44] })   // 全色只剩 3 号这一颗
+    if (!last.shoot({ angle: -Math.PI / 2, power: 0.55 })) fail('打自己组最后一颗应能出杆')
+    const rl = last.settleNow().result
+    const sl = last.state()
+    if (!rl) fail('这一杆应该有判定结果')
+    if (rl.foul) fail('合法打进本组最后一颗不该判犯规，实得「' + rl.foul + '」')
+    if (rl.pocketed.indexOf(3) < 0) fail('这一杆应该把 3 号打进，实得 ' + JSON.stringify(rl.pocketed))
+    if (sl.turn !== 0) fail('打进本组最后一颗后应该继续出杆，实得 turn=' + sl.turn)
+    if (sl.inHand) fail('没犯规就不该给自由球')
+    if (/犯规/.test(sl.message)) fail('提示里不该出现犯规，实得「' + sl.message + '」')
+    if (/换 /.test(sl.message)) fail('提示里不该出现换人，实得「' + sl.message + '」')
+    if (rl.kind !== 'continue') fail('这一杆的判定应该是 continue，实得 ' + rl.kind)
+    ok('打进本组最后一颗 → 不判犯规、继续出杆（"该打 8 号"从下一杆才开始算）')
+  }
+
   // ⑪ 存档往返 + 确定性：恢复后打同一杆，逐球坐标必须完全一致
   const a11 = layout({ 0: [30, 25], 1: [55, 20], 9: [70, 30], 8: [85, 25] })
   a11.settleNow()
@@ -1908,6 +1929,18 @@ console.log('\n=== 11. 美式八球浮窗：渲染 / 拉杆出杆 / 存档 / 关
     if (!/对手：双人/.test(txt())) fail('点一下应切到「双人」')
     btn('对手：双人').props.onClick()
     if (!/对手：电脑/.test(txt())) fail('再点一下应切回「电脑」')
+
+    // 轮到电脑时，提示行**必须显示刚打完那一杆的判定**（犯规原因 / 换人 / 进球继续），
+    // 不能一律写"电脑在想…" —— 那样用户看到的就是"轮到电脑 + 电脑立刻出杆"，
+    // 中间判了什么完全黑箱。用户报"打进最后一颗却换人、而且没报犯规"时踩的就是这个盲区。
+    {
+      const tipRow = tree().find((n) => n.props && n.props.className === 'dsh-skin-im2005-pool-tip')
+      const tipText = String(textOf(tipRow)).replace(/\s+/g, ' ').trim()
+      if (!/犯规/.test(tipText)) {
+        fail('轮到电脑时提示行应写明上一杆的判定（这一杆是犯规），实得「' + tipText + '」')
+      }
+      ok('轮到电脑 → 提示行显示上一杆的判定（「' + tipText.slice(0, 18) + '…」），不再一律写「电脑在想…」')
+    }
 
     // 上一杆犯规已经把回合交给了电脑 —— 它应该在 ~700ms 后自己出杆
     globalThis.rafQueue.length = 0

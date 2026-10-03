@@ -468,7 +468,14 @@ window.__ModuleLoader__.load({
         const opp = 1 - p
         const pocketed = f.pocketed.slice()
         const myGroup = game.groups[p]
-        const onEight = !!myGroup && groupLeft(myGroup) === 0
+        // ⚠️ 「该打 8 号了」必须看**这一杆开始之前**的局面，不能看击球之后的台面。
+        //    原写法是 groupLeft(myGroup) === 0 —— 而击球后自己那一组的最后一颗正好已经进袋，
+        //    于是"合法打进本组最后一颗"被回灌成"你该打 8 号、却先碰到了别的球" = 犯规，
+        //    回合白送给对手。用户实测报的就是这个：打进最后一颗 → 提示换人 / 轮到电脑 → 电脑立刻出杆，
+        //    而且看不到犯规原因（轮到电脑时提示行被"电脑在想…"占掉）。
+        //    改法：把这一杆打进的"自己组的球"加回去，还原出杆前的剩余数。
+        const pottedMine = myGroup ? pocketed.filter((id) => poolGroup(id) === myGroup).length : 0
+        const onEight = !!myGroup && groupLeft(myGroup) + pottedMine === 0
         const eightIn = pocketed.indexOf(8) >= 0
 
         let foul = null
@@ -3580,7 +3587,10 @@ window.__ModuleLoader__.load({
         }, hud.phase === 'over'
           ? (who(hud.winner === 0 ? 0 : 1) + ' 获胜')
           : (vsCpu && hud.turn === 1)
-            ? '电脑在想…'
+            // 轮到电脑时优先显示刚才那一杆的判定结果（"犯规：…" / "换 玩家 X" / "进球，继续"）。
+            // 原来无条件写"电脑在想…"，犯规原因和换人提示在电脑局里永远看不见，
+            // 用户报 bug 时只能看到"轮到电脑"+电脑立刻出杆，中间发生了什么完全黑箱。
+            ? (hud.message || '电脑在想…')
             : (hud.inHand || hud.phase === 'break')
               ? (hud.phase === 'break' ? '开球：拖母球可换位（需在开球线左侧）；出杆＝在母球外侧按住往后拉' : '自由球：拖母球可摆放；出杆＝在母球外侧按住往后拉')
               : (hud.message || '在球桌上按住鼠标往后拉 → 松手出杆')))
