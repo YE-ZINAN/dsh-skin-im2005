@@ -22,7 +22,7 @@ let captured = null
 const lsData = new Map()
 // ---- 提醒的夹具：假的 DOM / MutationObserver / AudioContext ----
 // 全部在 import 之前装好，因为 plug in 的 apply() 里会立刻检查它们。
-const fake = { running: false, pending: false, session: 's1', scopeAlive: true, noScope: false, rafCalls: 0, moCb: null, moCbs: [], bursts: 0, tones: 0, audioPlays: 0, audioSrc: '', disconnected: 0, runEffects: false }
+const fake = { running: false, pending: false, pendingKeys: { approval: ['boot-1'], question: [], plan: [] }, session: 's1', scopeAlive: true, noScope: false, rafCalls: 0, moCb: null, moCbs: [], bursts: 0, tones: 0, audioPlays: 0, audioSrc: '', disconnected: 0, runEffects: false }
 // 会话容器：isConnected 用 getter —— 要能模拟"运行中被换成别的会话（旧节点断开）"
 const scopeOf = () => ({
   get isConnected() { return fake.scopeAlive },
@@ -39,6 +39,18 @@ globalThis.document = {
     }
     if (s.indexOf('data-conversation-session') >= 0) return scopeOf()
     return fake.pending ? {} : null
+  },
+  // 待确认面板：客户端按 `[data-<kind>-key]` 扫全文档，并把属性值当 key 去重
+  querySelectorAll: (sel) => {
+    const m = /^\[([a-z-]+)\]$/.exec(String(sel))
+    if (!m) return []
+    const attr = m[1]
+    const kind = attr === 'data-approval-key' ? 'approval'
+      : attr === 'data-question-key' ? 'question'
+        : attr === 'data-plan-review-key' ? 'plan' : null
+    if (!kind) return []
+    const list = (fake.pendingKeys && fake.pendingKeys[kind]) || []
+    return list.map((k) => ({ getAttribute: (n) => (n === attr ? k : null) }))
   },
 }
 globalThis.MutationObserver = class {
@@ -1117,17 +1129,87 @@ if (!HAS_NOTIFY) {
     if (played() - base !== 1) fail('越过冷却后应恢复提醒，实得 ' + (played() - base))
     ok('冷却 2 秒：期内不连响，过后恢复')
 
-    // ⑨ **待确认面板彻底不再被监听**（源码级断言 —— 那条误触发路径必须从代码里消失）。
-    //    它原来会在每次切进"挂着面板的会话"时误响，用户要求只保留任务完成提醒。
+    // ⑨ **需要你确认时也要响**（用户实测报的缺失：等审批/反问时没有任何提示音）。
+    //    关键设计：**按 key 去重**，不是按"面板在不在"。面板是按会话挂载的、最小化后还留在
+    //    DOM 里，用布尔量判定就会"每次切进挂过面板的会话都咳一声"——那是当年被删掉的老 bug。
+    //    宿主源码里三个属性都写成 `"data-<kind>-key": pending.key`，值是这次请求的唯一标识。
     {
+      // ⑨a 首帧播种：夹具在 import 之前就挂了一个审批面板（boot-1），
+      //     插件注册观察器时的首次采样看到它 —— 那是"打开界面时就已经在等确认"，
+      //     不该算刚发生的事件。
+      base = played()
+      await sample(); await sample()
+      if (played() !== base) fail('打开界面时就已经挂着的待确认面板不该响（首帧只播种）')
+      ok('打开界面时就已存在的待确认面板 -> 不响（首帧只播种）')
+
+      // ⑨b 出现一个**新的**审批请求 -> 响一次，并在 tooltip 留下原因
+      base = played()
+      clock += 3000
+      fake.pendingKeys.approval = ['boot-1', 'a1']
+      await sample()
+      if (played() - base !== 1) fail('新的审批请求应该提醒一次，实得 ' + (played() - base))
+      {
+        const t = String((walk(render(regs.get('im2005-toolbar').comp), [])[2] || {}).props?.title || '')
+        if (!/上次提醒：需要你确认（审批）/.test(t)) {
+          fail('待确认提醒没在 tooltip 里写清原因，实得 ' + JSON.stringify(t))
+        }
+      }
+      ok('出现新的审批请求 -> 提醒一次（tooltip 写明「需要你确认（审批）」）')
+
+      // ⑨c **同一个请求被重新挂载 -> 不响**（这条是对老 bug 的负向断言）
+      //     模拟：切走再切回该会话，面板被卸载又重新挂载，key 不变。
+      base = played()
+      clock += 3000
+      fake.pendingKeys.approval = []          // 切走：面板卸载
+      await sample()
+      fake.pendingKeys.approval = ['boot-1', 'a1']   // 切回：同一个 key 又挂上
+      await sample()
+      if (played() !== base) fail('同一个待确认请求被重新挂载不该再响（这正是"点开别的会话就咳"的老 bug）')
+      // 再切几个来回也不该响
+      for (let i = 0; i < 3; i++) {
+        fake.pendingKeys.approval = []; await sample()
+        fake.pendingKeys.approval = ['boot-1', 'a1']; await sample()
+      }
+      if (played() !== base) fail('反复切进挂着同一个待确认面板的会话，不该反复响')
+      ok('同一个待确认请求反复挂载/卸载 -> 始终不响（按 key 去重，不是按面板存在）')
+
+      // ⑨d 另外两类确认（反问 / 计划审阅）也要响，各自用新的 key
+      base = played()
+      clock += 3000
+      fake.pendingKeys.question = ['q1']
+      await sample()
+      if (played() - base !== 1) fail('新的反问请求应该提醒一次，实得 ' + (played() - base))
+      clock += 3000
+      fake.pendingKeys.plan = ['p1']
+      await sample()
+      if (played() - base !== 2) fail('新的计划审阅请求也应该提醒，实得 ' + (played() - base))
+      ok('反问 / 计划审阅的新请求 -> 各自提醒一次')
+
+      // ⑨e 冷却：一次里同时冒出的多个新 key 只响一声（2 秒内不连响）
+      base = played()
+      clock += 100           // 距上次提醒不足 2 秒
+      fake.pendingKeys.approval = ['boot-1', 'a1', 'a2']
+      await sample()
+      if (played() !== base) fail('冷却期内的新确认请求不该响，实得 ' + (played() - base))
+      {
+        const t = String((walk(render(regs.get('im2005-toolbar').comp), [])[2] || {}).props?.title || '')
+        if (!/距上次提醒不足 2 秒/.test(t)) fail('被冷却拦下的那次没有留下诊断记录，实得 ' + JSON.stringify(t))
+      }
+      ok('冷却期内的新确认请求 -> 不响（并在 tooltip 留下诊断）')
+
+      // ⑨f 源码级：必须真的拿属性值当 key（防止有人改回"面板存在就响"）
       const { readFileSync } = await import('node:fs')
       const src = readFileSync(file.replace('file:///', ''), 'utf8')
-      // 先去掉注释：源码注释里会提到这几个属性名（解释"为什么不用它"），那不是代码
-      const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
-      if (/data-approval-key|data-question-key|data-plan-review-key/.test(code)) {
-        fail('客户端又在监听待确认面板了 —— 切进挂着面板的会话会反复误触发')
+      if (!/data-approval-key/.test(src) || !/seenKeys/.test(src)) {
+        fail('待确认提醒必须是"按 key 去重"的实现（缺 data-approval-key 或 seenKeys）')
       }
-      ok('代码里完全不碰待确认面板（该误触发路径已消失）')
+      ok('待确认提醒按 key 去重（源码级检查：seenKeys 去重 + 读 data-*-key 属性值）')
+      // 收尾：把夹具恢复成"没有待确认面板"，免得影响后面的小节
+      fake.pendingKeys.approval = []
+      fake.pendingKeys.question = []
+      fake.pendingKeys.plan = []
+      await sample()
+      clock += 3000
     }
 
     // ⑩ 开关：关掉后完全静音、状态落盘；再打开会试听一声
