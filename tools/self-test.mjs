@@ -3815,9 +3815,33 @@ console.log('\n=== 21. 德州扑克：九档牌型辅助 + 6 人桌对局 + 摊�
       if (h.cat !== cat) fail(why + '：牌型级应为 ' + cat + '，实得 ' + h.cat + '（' + h.zh + '）')
       if (h.tie[0] !== top) fail(why + '：第一比较项应为 ' + top + '，实得 ' + h.tie[0])
     }
-    if (ev(['Ah', 'Ad', 'Ac', 'As', 'Kd', 'Qc', '2h']).best.length !== 5) fail('best 必须是 5 张')
+    // ⚠️ best 必须是「5 张真牌的数组」——**九档逐档查**。
+    //    顺子那一支曾经把 {high,ranks} 对象当数组传：牌型级、踢脚、牌型名全对，
+    //    只有 best 不是数组，界面里的金边高亮一调 .indexOf 就抛错 → 错误边界接管 → 牌桌闪退。
+    //    单元断言当时只查了四条/同花两支，漏了顺子；现在九档全查。
+    const catCases = [
+      [['Ah', 'Kd', 'Qc', 'Js', '9h', '2c', '3h'], 0, '高牌'],
+      [['Ah', 'Ad', 'Kh', 'Qd', 'Jc', '2c', '3h'], 1, '一对'],
+      [['Ah', 'Ad', 'Kh', 'Kd', 'Qc', '2c', '3h'], 2, '两对'],
+      [['Ah', 'Ad', 'Ac', 'Kh', 'Qd', '2c', '3h'], 3, '三条'],
+      [['9h', '8d', '7c', '6s', '5h', 'Kd', '2c'], 4, '顺子'],
+      [['2h', '5h', '9h', 'Jh', 'Kh', 'Ah', '3c'], 5, '同花'],
+      [['Ah', 'Ad', 'Ac', 'Kh', 'Kd', 'Qc', '2h'], 6, '葫芦'],
+      [['Ah', 'Ad', 'Ac', 'As', 'Kd', 'Qc', '2h'], 7, '四条'],
+      [['9s', '8s', '7s', '6s', '5s', '2d', '3c'], 8, '同花顺'],
+    ]
+    for (const [cards, cat, zh] of catCases) {
+      const hh = ev(cards)
+      if (hh.cat !== cat) fail('best 逐个查：' + zh + ' 的牌型级应为 ' + cat + '，实得 ' + hh.cat)
+      if (!Array.isArray(hh.best)) fail(zh + ' 的 best 不是数组：' + JSON.stringify(hh.best))
+      if (hh.best.length !== 5) fail(zh + ' 的 best 应是 5 张，实得 ' + hh.best.length)
+      for (const c of hh.best) {
+        if (typeof c !== 'string' || !/^[2-9TJQKA][shdc]$/.test(c)) fail(zh + ' 的 best 里有非牌值：' + JSON.stringify(c))
+        if (cards.indexOf(c) < 0) fail(zh + ' 的 best 里有不属于这手牌的牌：' + c)
+      }
+    }
     if (ev(['2h', '5h', '9h', 'Jh', 'Kh', 'Ah', '3c']).best.indexOf('2h') >= 0) fail('六张同花该丢掉最小的 2h')
-    ok('扑克评估器：' + cases.length + ' 组牌型/边界全部定级正确（含轮子、双三条、公共牌成牌）')
+    ok('扑克评估器：' + cases.length + ' 组牌型/边界定级正确 + **九档的 best 都是 5 张真牌**（顺子那支曾经不是数组）')
   }
 
   // ② 比大小 + 摊牌解释（"为什么输"必须说人话）
@@ -4041,6 +4065,80 @@ console.log('\n=== 21. 德州扑克：九档牌型辅助 + 6 人桌对局 + 摊�
     if (!/engine\.POKER|POKER/.test(region('GAME-POKER-REG'))) fail('注册项应把引擎通过 inject 交出去（测试与界面走同一条路径）')
     ok('静态审计：牌桌不碰提醒功能；音效只走两个收口、认游戏音效开关、受专注模式时间门管辖')
   }
+}
+
+// ===== 22. 扑克耐久：每个动作之后都渲染一次真实组件（抓"渲染期抛错被错误边界接管"）=====
+// 这一节就是被真事故逼出来的：顺子那支把 best 写错，界面每帧都抛错、被错误边界接管成一个小 ⚠，
+// 用户看到的是"牌桌自己闪退了"，而日志/事件查看器/崩溃转储里一个字都没有。
+// 单元断言查不到（要看具体牌面），穷举断言也查不到（它只看 cat/tie）——只有"每个状态都渲染一遍"能抓到。
+{
+  const SOAK_N = Number(process.env.POKER_SOAK) || 200
+  console.log('\n=== 22. 扑克耐久：' + SOAK_N + ' 局，每个动作后都渲染一次真实组件 ===')
+  const injS = regs.get('im2005-poker').opts.inject()
+  const compS = regs.get('im2005-poker').comp
+  const engS = injS.engine.live()
+  const walkQ = (n, out, d) => {
+    const dd = d || 0
+    if (!n || typeof n !== 'object' || dd > 18) return out
+    // 这里**故意不 try/catch** —— 组件抛错必须冒出来
+    if (typeof n.type === 'function') return walkQ(instantiate(n.type, n.props), out, dd + 1)
+    out.push(n)
+    ;(n.children || []).forEach((c) => walkQ(c, out, dd + 1))
+    return out
+  }
+  const btn = (kw) => walk(instantiate(regs.get('im2005-toolbar').comp), [])
+    .find((b) => b.type === 'button' && JSON.stringify(b.children || '').includes(kw))
+  if (!engS) fail('拿不到界面正在用的引擎')
+  const check = (where) => {
+    let tree
+    try {
+      tree = walkQ(instantiate(compS, injS), [], 0)
+    } catch (e) {
+      fail('渲染抛错 @' + where + ' → ' + (e && e.message))
+    }
+    if (!tree.find((n) => n.props && n.props.className === 'dsh-skin-im2005-poker')) {
+      fail('界面容器不见了 @' + where + '（错误边界接管 = 用户看到的"闪退"）')
+    }
+    const warn = tree.find((n) => typeof n.children === 'string' && n.children.indexOf('⚠') === 0)
+    if (warn) fail('错误边界接管了 @' + where + ' → ' + warn.props.title)
+  }
+  const rendered = () => {
+    try {
+      return walkQ(instantiate(compS, injS), [], 0)
+        .some((n) => n.props && n.props.className === 'dsh-skin-im2005-poker')
+    } catch (e) { return false }
+  }
+  // 开窗：pokerOpen 是 toggle，反复点到真的渲染出来为止（顺便验证按钮没被卡在某个状态）
+  let tries = 0
+  while (!rendered() && tries++ < 3) btn('德州扑克').props.onClick()
+  if (!rendered()) fail('点了 ' + tries + ' 次「德州扑克」都没打开牌桌（开关卡住了？）')
+  check('open')
+  let hands = 0
+  let steps = 0
+  const t0 = Date.now()
+  while (hands < SOAK_N && Date.now() - t0 < 180000) {
+    if (engS.over()) {
+      engS.newHand()
+      hands++
+      check('hand' + hands + '-deal')
+      continue
+    }
+    const i = engS.actor()
+    if (i < 0) fail('actor() = -1 但 over() = false（卡死）')
+    const legal = engS.legal()
+    const a = i === 0
+      ? (legal.find((x) => x.id === 'call') || legal.find((x) => x.id === 'check') || legal[0])
+      : engS.botDecide(i)
+    if (!engS.act(a)) fail('动作被拒 @' + JSON.stringify(a))
+    steps++
+    check('hand' + hands + '-step' + steps)
+  }
+  // 顺手钉住"渲染之外不许裸奔"：计时/点击路径上的引擎调用都在 guard 里
+  if (!/const guard = \(label, fn\)/.test(fs.readFileSync('dsh-skin-im2005/client.js', 'utf8'))) {
+    fail('牌桌的 guard（渲染之外的引擎调用兜底）不见了')
+  }
+  ok('耐久：' + hands + ' 局 / ' + steps + ' 个动作，每个动作后都渲染一次真实组件，'
+    + '没有一次被错误边界接管（' + Math.round((Date.now() - t0) / 1000) + 's）')
 }
 
 console.log('\nALL CHECKS PASSED ✓')

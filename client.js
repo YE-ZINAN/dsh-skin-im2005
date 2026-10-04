@@ -1582,7 +1582,11 @@ window.__ModuleLoader__.load({
       const st = pokerBestStraight(ranksDesc)
       if (st) {
         const best = st.ranks.map(one)
-        return mk(4, [st.high], st,
+        // ⚠️ 第三个参数必须是**5 张牌的数组**（`best`），不能是 st（{high,ranks} 对象）。
+        //    写成 st 时 tie 是对的、牌型名也对，只有"哪 5 张在比"不是数组 ——
+        //    界面里的金边高亮一调 .indexOf 就抛错，被错误边界接管成 ⚠ 标记，
+        //    用户看到的就是"牌桌自己闪没了"。0.19.1 修（这一条有断言 + 耐久测试守着）。
+        return mk(4, [st.high], best,
           pokerLabel(st.high) + ' 高' + (st.high === 5 ? '（A 当 1）' : ''))
       }
       // ⑥ 三条
@@ -3149,11 +3153,22 @@ window.__ModuleLoader__.load({
         static getDerivedStateFromError(err) { return { err } }
         componentDidCatch(err) {
           console.warn('[dsh-skin-im2005] ' + label + ' 渲染失败，已隔离', err)
+          // 落一条可查的诊断：用户报"窗口自己没了"时，我们能拿到错误原文。
+          // （0.19.1 加的 —— 之前顺子那支把 best 写错，窗口被隔离成一个小 ⚠，
+          //   日志、事件查看器、崩溃转储里一个字都没有，只能靠复现。）
+          try {
+            window.localStorage.setItem('dsh-skin-im2005.lasterr', JSON.stringify({
+              label,
+              msg: String((err && err.message) || err),
+              stack: String((err && err.stack) || '').slice(0, 600),
+              t: Date.now(),
+            }))
+          } catch (e) {}
         }
         render() {
           if (this.state.err) {
             return h('span', {
-              title: String((this.state.err && this.state.err.message) || this.state.err),
+              title: '插件组件渲染失败：' + String((this.state.err && this.state.err.message) || this.state.err),
               style: { font: '10px/1 "SimSun",sans-serif', color: '#8a1f1f' },
             }, '⚠ ' + label)
           }
@@ -5927,6 +5942,24 @@ window.__ModuleLoader__.load({
       const tickRef = React.useRef(0)
       const mounted = React.useRef(true)
 
+      // 渲染之外跑的引擎调用一律不许裸奔：抛出去就是"未捕获错误"（外壳会当致命错误处理），
+      // 而且计时链会静默断掉、牌桌看起来像自己卡死。统一在这里兜住 + 留一条可查的诊断。
+      // ⚠️ 定义必须早于 boot：下面读存档那一步也要兜（坏档抛错会发生在渲染期）。
+      const guard = (label, fn) => {
+        try { return fn() } catch (err) {
+          const msg = String((err && err.message) || err)
+          try { console.warn('[dsh-skin-im2005] 牌桌 ' + label + ' 出错', err) } catch (e) {}
+          try {
+            window.localStorage.setItem('dsh-skin-im2005.lasterr', JSON.stringify({
+              label: 'poker:' + label, msg,
+              stack: String((err && err.stack) || '').slice(0, 600), t: Date.now(),
+            }))
+          } catch (e) {}
+          try { store.set({ pokerNote: '牌桌出错了（' + label + '）：' + msg }) } catch (e) {}
+          return null
+        }
+      }
+
       if (!boot.current) {
         let eng = POKER_ENG
         let resumed = false
@@ -5936,11 +5969,20 @@ window.__ModuleLoader__.load({
         } else {
           eng = makeEngine({})
           const sv = save.read()
-          if (sv && eng.restore(sv)) {
-            const cur = eng.state()
-            resumed = !!(cur && !cur.over)
+          // 存档读回也要兜住：坏档在这里抛错会发生在**渲染期**，直接被错误边界接管成 ⚠，
+          // 而且坏档留在盘上 → 以后每次开牌桌都消失。宁可当没存过，重开一局。
+          if (sv) {
+            try {
+              if (eng.restore(sv)) {
+                const cur = eng.state()
+                resumed = !!(cur && !cur.over)
+              }
+            } catch (err) {
+              try { console.warn('[dsh-skin-im2005] 牌桌存档读回失败，已改用新局', err) } catch (e) {}
+              resumed = false
+            }
           }
-          if (!resumed) eng.newHand()
+          if (!resumed) guard('newHand', () => eng.newHand())
           POKER_ENG = eng
         }
         boot.current = { eng, resumed }
@@ -6004,7 +6046,7 @@ window.__ModuleLoader__.load({
       }
       const doAct = (a) => () => {
         const streetBefore = eng.state().street
-        if (!eng.act(a)) return
+        if (!guard('act', () => eng.act(a))) return
         sfxOn()
         if (a.id === 'fold') pokerSfxFold()
         else if (a.id === 'check') pokerSfxCheck()
@@ -6016,7 +6058,7 @@ window.__ModuleLoader__.load({
         if (!cur.over && eng.actor() > 0) scheduleTick(420)
       }
       const nextHand = () => {
-        eng.newHand()
+        guard('newHand', () => eng.newHand())
         sfxOn()
         pokerSfxDeal()
         sync()
@@ -6113,8 +6155,11 @@ window.__ModuleLoader__.load({
         ])
       }
 
-      // 7 选 5 的结果：这 5 张才是真正拿去比大小的
-      const inBest = (c) => !!(hud.me.hand && hud.me.hand.best && hud.me.hand.best.indexOf(c) >= 0)
+      // 7 选 5 的结果：这 5 张才是真正拿去比大小的。
+      // ⚠️ 这里必须**防御性判断是不是数组**：评估器只要有一支把 best 写错（曾经真把
+      //    {high,ranks} 当数组传过），渲染就会抛错 → 被错误边界接管 → 牌桌"闪退"。
+      //    画不出金边可以忍，把整个窗口搞没不行。
+      const inBest = (c) => !!(hud.me.hand && Array.isArray(hud.me.hand.best) && hud.me.hand.best.indexOf(c) >= 0)
 
       const boardRow = h('div', {
         key: 'board',
