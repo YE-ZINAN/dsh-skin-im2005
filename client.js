@@ -145,7 +145,129 @@ window.__ModuleLoader__.load({
         // 公开版：本地专属的提醒功能已整体剥离。
 
 
-    
+    /* FOCUS:BEGIN */
+    /* ================================================================== *
+     * 专注模式：设定专注几分钟，期间**这个插件一声都不响**，时间到自动恢复。
+     *
+     * ⚠️ 这一段**两个版本都保留**（公开版没有提醒声，但游戏音效同样受它管）。
+     *    所以这里的文案必须中立：不能出现提醒功能的关键词 ——
+     *    公开版的残留检查会逐字匹配，写了就判"没剥干净"。
+     *    提醒相关的那句话放在本地专属的 NOTIFY 标记区里。
+     *
+     * 两条设计纪律：
+     *   ① 判定**按时间算**（now < until），不是"把某个开关改成关" ——
+     *      **绝不改写** poolSfx.on / farmSfx / 提醒开关。否则会出现"专注结束后，
+     *      用户本来关着的东西被自动打开了"这种串台（农场音效就踩过同类坑）。
+     *      静音一律在**声音入口**按时间判定；第 17 节的静态审计会钉死这一点。
+     *   ② 「结束后自动恢复」不需要任何回调：那一刻起 `focusActive()` 自己变 false。
+     *      时间到只做两件事：停掉每秒刷新的定时器、把存档里的 until 清零。
+     *
+     * 存档：`dsh-skin-im2005.focus` = {v:1, until, minutes}（until 是**绝对时间戳**，
+     * 刷新界面/重开 DSH 都还算数）。面板开关另存 `…focusopen`。
+     * ================================================================== */
+    const FOCUS_KEY = 'dsh-skin-im2005.focus'
+    const FOCUS_OPEN_KEY = 'dsh-skin-im2005.focusopen'
+    const FOCUS_MIN_MIN = 1
+    const FOCUS_MIN_MAX = 180
+    const FOCUS_DEFAULT_MIN = 25
+
+    const clampFocusMin = (m) => {
+      const n = Math.round(Number(m))
+      if (!isFinite(n) || n <= 0) return FOCUS_DEFAULT_MIN
+      return Math.max(FOCUS_MIN_MIN, Math.min(FOCUS_MIN_MAX, n))
+    }
+
+    /** 剩余毫秒 → "12:34" / "1:02:03" */
+    const focusLeftText = (ms) => {
+      const total = Math.max(0, Math.ceil((Number(ms) || 0) / 1000))
+      const h = Math.floor(total / 3600)
+      const m = Math.floor((total % 3600) / 60)
+      const s = total % 60
+      const two = (n) => (n < 10 ? '0' + n : String(n))
+      return h > 0 ? h + ':' + two(m) + ':' + two(s) : two(m) + ':' + two(s)
+    }
+
+    /**
+     * 专注计时（纯逻辑，方便测试）：只存一个绝对时间戳 until。
+     * @param opts.now 注入时钟（测试用）
+     */
+    const createFocus = (o) => {
+      const opt = o || {}
+      const now = opt.now || (() => Date.now())
+      let until = 0
+      let minutes = 0
+      return {
+        until: () => until,
+        minutes: () => minutes,
+        /** 现在是否处于专注中 */
+        active: () => until > now(),
+        /** 还剩多少毫秒（可传时间点，默认现在） */
+        remaining: (at) => {
+          const t = (at === undefined) ? now() : at
+          return until > t ? until - t : 0
+        },
+        /** 开始专注，返回结束时间戳 */
+        start: (m) => {
+          minutes = clampFocusMin(m)
+          until = now() + minutes * 60000
+          return until
+        },
+        stop: () => { until = 0 },
+        serialize: () => ({ v: 1, until, minutes }),
+        restore: (src) => {
+          if (!src || typeof src !== 'object') return false
+          if (src.v !== 1) return false
+          const u = Number(src.until)
+          if (!isFinite(u) || u < 0) return false
+          until = u
+          const m = Number(src.minutes)
+          minutes = (isFinite(m) && m > 0) ? clampFocusMin(m) : 0
+          return true
+        },
+      }
+    }
+
+    const readFocus = () => {
+      try {
+        const raw = window.localStorage.getItem(FOCUS_KEY)
+        if (!raw) return null
+        return JSON.parse(raw)
+      } catch (err) { return null }
+    }
+
+    const writeFocus = (v) => {
+      try { window.localStorage.setItem(FOCUS_KEY, JSON.stringify(v)) } catch (err) {}
+    }
+
+    const readFocusOpen = () => {
+      try { return window.localStorage.getItem(FOCUS_OPEN_KEY) === '1' } catch (err) { return false }
+    }
+
+    const writeFocusOpen = (on) => {
+      try { window.localStorage.setItem(FOCUS_OPEN_KEY, on ? '1' : '0') } catch (err) {}
+    }
+
+    // 模块级单例：窗口是挂载/卸载的，专注状态不能跟着界面一起丢
+    const FOCUS_STATE = { eng: createFocus(), min: FOCUS_DEFAULT_MIN }
+    {
+      const sv = readFocus()
+      if (sv && FOCUS_STATE.eng.restore(sv)) {
+        if (sv.minutes > 0) FOCUS_STATE.min = clampFocusMin(sv.minutes)
+      }
+    }
+
+    /** 现在是否处于专注中（所有声音入口的唯一判据都走它） */
+    const focusActive = () => FOCUS_STATE.eng.active()
+
+    /** 「专注模式」按钮的 tooltip：状态写在这里，不写按钮文字上 */
+    const focusTooltip = () => {
+      if (!focusActive()) {
+        return '专注模式：输入专注几分钟。专注期间不响任何声音（游戏音效与提醒），时间到自动恢复（默认 ' + FOCUS_DEFAULT_MIN + ' 分钟）'
+      }
+      return '专注模式：专注中，还剩 ' + focusLeftText(FOCUS_STATE.eng.remaining()) +
+        '（这期间不响任何声音，结束后自动恢复）\n点开面板可以提前结束'
+    }
+    /* FOCUS:END */
 
     /* ================================================================== *
      * 美式八球引擎 —— 纯逻辑，不碰 DOM
@@ -986,6 +1108,8 @@ window.__ModuleLoader__.load({
     /** v = 撞击强度（单位/秒）。返回是否真的发声了（测试要靠它计数）。 */
     const poolClack = (v, tune) => {
       if (!poolSfx.on) return false
+      // 专注模式：按**时间**判定（不是去改 poolSfx.on —— 那会串台，见 §4.6b）
+      if (focusActive()) return false
       const ctx = poolAudioCtx()
       if (!ctx) return false
       try {
@@ -1011,6 +1135,9 @@ window.__ModuleLoader__.load({
       } catch (err) { return false }
     }
     const poolTone = (freq, vol, dur) => {
+      // 专注模式：游戏里所有"音调类"声音都走这里（撞库/出杆/扫雷/农场），
+      // 和 poolClack 一起构成两个收口 —— 以后新增音效自动受专注模式管。
+      if (focusActive()) return false
       const ctx = poolAudioCtx()
       if (!ctx || typeof ctx.createOscillator !== 'function') return false
       try {
@@ -1941,7 +2068,12 @@ window.__ModuleLoader__.load({
       setNickname: null,
       
       
-      
+      /* FOCUS-STORE:BEGIN */
+      // 专注模式：面板开关 / 剩余毫秒（给 tooltip，每秒刷新）/ 上次设定的分钟数
+      focusOpen: readFocusOpen(),
+      focusLeft: FOCUS_STATE.eng.remaining(),
+      focusMin: FOCUS_STATE.min,
+      /* FOCUS-STORE:END */
       /* GAME-UI-STORE:BEGIN */
       // 美式八球：窗口开关 / 按钮 tooltip 上的存档说明 / 任务完成提示 / 对手 / 难度 / 音效
       poolOpen: false,
@@ -2442,7 +2574,13 @@ window.__ModuleLoader__.load({
             } catch (err) {}
           }),
         /* GAME-BUTTON:END */
-        
+        /* FOCUS-BUTTON:BEGIN */
+        // 专注模式：设定专注几分钟，期间不响任何声音。按钮文字恒定，状态在 tooltip 里。
+        // 位置由用户指定：**排在最后一个功能按钮的右边**（在「后台任务」之后）。
+        btn('focus', '专注模式', focusTooltip(),
+          () => { try { if (s.toggleFocus) s.toggleFocus() } catch (err) {} },
+          s.focusOpen || focusActive()),
+        /* FOCUS-BUTTON:END */
       )
     }
 
@@ -5203,7 +5341,136 @@ window.__ModuleLoader__.load({
 
         
 
-        
+        /* FOCUS-TOGGLE:BEGIN */
+        // ---- 专注模式：开始 / 提前结束 / 每秒刷新剩余时间 ----
+        // ⚠️ 这里只写自己的两个键（…focus / …focusopen），**绝不动提醒开关** ——
+        //    "专注结束自动开回"是靠时间判定的结果，不是把用户关着的开关打开。
+        let focusTimer = 0
+        const clearFocusTimer = () => {
+          if (!focusTimer) return
+          try { clearInterval(focusTimer) } catch (err) {}
+          focusTimer = 0
+        }
+        const focusTick = () => {
+          const left = FOCUS_STATE.eng.remaining()
+          store.set({ focusLeft: left })
+          if (left > 0) return
+          // 时间到：停表 + 把存档里的 until 清零（此后 focusActive() 自己变 false → 声音恢复）
+          clearFocusTimer()
+          FOCUS_STATE.eng.stop()
+          writeFocus({ v: 1, until: 0, minutes: FOCUS_STATE.min })
+        }
+        const ensureFocusTimer = () => {
+          clearFocusTimer()
+          if (!focusActive()) return
+          try { focusTimer = setInterval(focusTick, 1000) } catch (err) { focusTimer = 0 }
+        }
+        store.toggleFocus = () => {
+          const on = !store.focusOpen
+          store.set({ focusOpen: on })
+          writeFocusOpen(on)
+          store.set({ focusLeft: FOCUS_STATE.eng.remaining() })
+        }
+        store.startFocus = (min) => {
+          const m = clampFocusMin(min)
+          FOCUS_STATE.min = m
+          FOCUS_STATE.eng.start(m)
+          writeFocus({ v: 1, until: FOCUS_STATE.eng.until(), minutes: m })
+          store.set({ focusMin: m, focusLeft: FOCUS_STATE.eng.remaining() })
+          ensureFocusTimer()
+        }
+        store.stopFocus = () => {
+          clearFocusTimer()
+          FOCUS_STATE.eng.stop()
+          writeFocus({ v: 1, until: 0, minutes: FOCUS_STATE.min })
+          store.set({ focusLeft: 0 })
+        }
+        // 上次的专注还没结束就重开了界面：接着跑（存档里是绝对时间戳）
+        ensureFocusTimer()
+
+        /**
+         * 专注模式面板：输入时长 / 显示倒计时 / 提前结束。
+         * 是个小固定面板（不做拖动缩放）—— 它只在"要设定一下"和"看一眼还剩多久"时用，
+         * 状态本身活在模块级单例里，窗口关掉不影响计时。
+         */
+        const ImFocusWindow = () => {
+          const s = useStore()
+          const [draft, setDraft] = React.useState(String(FOCUS_STATE.min))
+          if (!s.focusOpen) return null
+          const on = focusActive()
+          const left = on ? FOCUS_STATE.eng.remaining() : 0
+          const face = faceOf(s.scheme)
+          const bar = { border: '1px solid ' + IM_EDGE, background: '#ffffff', boxShadow: bevel(face, IM_EDGE) }
+          const btnStyle = {
+            border: '1px solid ' + IM_EDGE, background: 'linear-gradient(#ffffff,#e6eef8)', color: '#1a1a1a',
+            font: '11px/1.5 SimSun, serif', padding: '2px 9px', cursor: 'pointer', pointerEvents: 'auto',
+          }
+          const row = (extra) => Object.assign({ display: 'flex', alignItems: 'center' }, extra || {})
+          const start = () => { try { if (s.startFocus) s.startFocus(draft) } catch (err) {} }
+          return h('div', {
+            className: 'dsh-skin-im2005-focus',
+            style: {
+              position: 'fixed', right: '24px', bottom: '104px', width: '238px',
+              zIndex: Z + 4, pointerEvents: 'none',
+            },
+          }, h('div', { style: Object.assign({ pointerEvents: 'auto' }, bar) }, [
+            // 标题栏
+            h('div', {
+              key: 'title',
+              style: {
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '3px 6px', background: 'linear-gradient(#3a6ea5,#24578f)', color: '#ffffff',
+                font: '12px/1.6 SimSun, serif',
+              },
+            }, [
+              h('span', { key: 't' }, '专注模式'),
+              h('button', {
+                key: 'x', type: 'button',
+                title: '关闭面板（专注继续跑，时间到自动恢复）',
+                onClick: () => { try { if (s.toggleFocus) s.toggleFocus() } catch (err) {} },
+                style: { border: '1px solid #1b4a7a', background: '#e6eef8', color: '#1a1a1a', font: '10px/1 SimSun, serif', padding: '1px 5px', cursor: 'pointer', pointerEvents: 'auto' },
+              }, '✕'),
+            ]),
+            on
+              ? h('div', { key: 'on', style: { padding: '8px 8px 9px' } }, [
+                // 倒计时：数字用等宽字体，免得每秒宽度跳动
+                h('div', { key: 'left', style: { textAlign: 'center', font: 'bold 26px/1.3 Consolas, monospace', color: IM_BLUE_DEEP } }, focusLeftText(left)),
+                h('div', { key: 'say', style: { textAlign: 'center', font: '11px/1.7 SimSun, serif', color: '#333', marginTop: '2px' } },
+                  '专注中：这期间不响任何声音，结束自动恢复'),
+                h('div', { key: 'min', style: { textAlign: 'center', font: '11px/1.7 SimSun, serif', color: '#666' } },
+                  '本次设定 ' + FOCUS_STATE.eng.minutes() + ' 分钟'),
+                h('div', { key: 'b', style: row({ justifyContent: 'center', marginTop: '6px' }) }, [
+                  h('button', {
+                    key: 'stop', type: 'button',
+                    onClick: () => { try { if (s.stopFocus) s.stopFocus() } catch (err) {} },
+                    style: btnStyle,
+                  }, '提前结束'),
+                ]),
+              ])
+              : h('div', { key: 'off', style: { padding: '8px 8px 9px' } }, [
+                h('div', { key: 'lab', style: { font: '11px/1.7 SimSun, serif', color: '#333', marginBottom: '4px' } }, '专注几分钟：'),
+                h('div', { key: 'in', style: row({ gap: '6px' }) }, [
+                  h('input', {
+                    key: 'min', type: 'text', inputMode: 'numeric', value: draft,
+                    'aria-label': '专注分钟数',
+                    onChange: (e) => setDraft(String((e && e.target && e.target.value) !== undefined ? e.target.value : '')),
+                    onKeyDown: (e) => { if (e && e.key === 'Enter') start() },
+                    style: {
+                      width: '64px', border: '1px solid ' + IM_EDGE, background: '#ffffff', color: '#1a1a1a',
+                      font: '12px/1.5 SimSun, serif', padding: '2px 4px', pointerEvents: 'auto',
+                    },
+                  }),
+                  h('span', { key: 'u', style: { font: '11px/1.7 SimSun, serif', color: '#666' } }, '分钟（1–180）'),
+                ]),
+                h('div', { key: 'b', style: row({ justifyContent: 'flex-end', gap: '6px', marginTop: '7px' }) }, [
+                  h('button', { key: 'go', type: 'button', onClick: start, style: btnStyle }, '开始专注'),
+                ]),
+                h('div', { key: 'tip', style: { font: '11px/1.7 SimSun, serif', color: '#666', marginTop: '5px' } },
+                  '专注期间不响任何声音，时间到自动恢复。各个音效开关本身不受影响。'),
+              ]),
+          ]))
+        }
+        /* FOCUS-TOGGLE:END */
 
         
 
@@ -5475,7 +5742,17 @@ window.__ModuleLoader__.load({
               view: TASK_VIEW,
             }),
           }],
-          
+          /* FOCUS-VIEW:BEGIN */
+          // 专注模式面板（浮层）。计时/存档/开关都在模块级，测试通过 inject 拿同一条路径。
+          ['shell.overlay', 'im2005-focus', ImFocusWindow, {
+            inject: () => ({
+              engine: { create: createFocus, FOCUS_MIN_MAX, FOCUS_MIN_MIN, FOCUS_DEFAULT_MIN },
+              save: { read: readFocus, write: writeFocus },
+              openFlag: { read: readFocusOpen, write: writeFocusOpen },
+              leftText: focusLeftText,
+            }),
+          }],
+          /* FOCUS-VIEW:END */
           // 跨会话备注框（浮层）。内容/位置/开关都走 inject，测试拿到同一条路径。
           ['shell.overlay', 'im2005-note', ImNoteWindow, {
             inject: () => ({

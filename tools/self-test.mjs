@@ -3526,16 +3526,10 @@ console.log('\n=== 19. 后台任务浮窗：点开才看 / 列出正在跑的任
   ok('后台任务：关掉即不渲染，开关落盘')
 }
 
-console.log('\n=== 20. 专注模式：设定时长 / 期间不提醒 / 到点自动恢复 ===')
-if (!HAS_NOTIFY) {
-  // 公开版：专注模式与提醒功能一起被剥离 —— 不该有按钮、浮层、存储键
-  const labels20 = walk(render(regs.get('im2005-toolbar').comp), [])
-    .map((b) => (b.children || []).map((c) => (c && c.children) || c).join(''))
-  if (labels20.some((l) => String(l).includes('专注模式'))) fail('公开版不该有「专注模式」按钮')
-  if (regs.has('im2005-focus')) fail('公开版不该注册专注模式浮层')
-  if (lsData.has('dsh-skin-im2005.focus')) fail('公开版不该写专注模式存储键')
-  ok('无提醒功能的版本（公开版）-> 没有专注模式按钮 / 浮层 / 存储键')
-} else {
+console.log('\n=== 20. 专注模式：设定时长 / 期间不响任何声音 / 到点自动恢复 ===')
+{
+  // ⚠️ 1.15.0 起**公开版也带**专注模式：公开版没有提醒声可关，但游戏音效同样归它管。
+  //    所以这一节两个版本都跑；只有"提醒声也被静音"那段代码是本地版专属，按 HAS_NOTIFY 分支。
   const focusInj = regs.get('im2005-focus').opts.inject()
   const FMAX = focusInj.engine.FOCUS_MIN_MAX
   const FDEF = focusInj.engine.FOCUS_DEFAULT_MIN
@@ -3629,6 +3623,15 @@ if (!HAS_NOTIFY) {
     ok('专注面板：不点不渲染；点开有分钟输入框与「开始专注」')
 
     // 输入 2 分钟 → 开始（走界面路径）
+    // 前提先验：**专注开始前**游戏音效确实能发声，否则后面的静音断言会假通过
+    const poolSfx0 = regs.get('im2005-pool').opts.inject().sfx
+    poolSfx0.set(true)
+    {
+      const gs0 = fake.bursts + fake.tones
+      if (poolSfx0.clack(120, 2000) !== true) fail('夹具前提不成立：非专注状态下撞球音发不出来')
+      if (fake.bursts + fake.tones <= gs0) fail('前提检查：撞球音没真的发声')
+      ok('前提：专注开始前，游戏音效是能发出来的')
+    }
     inp.props.onChange({ target: { value: '2' } })
     btn20('开始专注').props.onClick()
     const savedF = JSON.parse(lsData.get('dsh-skin-im2005.focus') || 'null')
@@ -3643,28 +3646,57 @@ if (!HAS_NOTIFY) {
     }
     ok('开始专注 → 倒计时 + 落盘 + tooltip 写明剩余时间')
 
-    // ③ 专注期间：任务完成 / 需要你确认 都不提醒
+    // ③ 专注期间：**这个插件一声都不响**。
+    //    游戏音效由两个收口管（poolClack 噪声类 / poolTone 音调类），本地版还多一个提醒声（③b）。
+    {
+      const poolSfx = regs.get('im2005-pool').opts.inject().sfx
+      const sfxKeyBefore = lsData.get('dsh-skin-im2005.poolsfx')
+      const gameSounds = () => fake.bursts + fake.tones
+      // 专注中：四类游戏音效全部静音（clack 走 poolClack；rail/cue 走 poolTone；pot 两者都用）
+      const baseGame = gameSounds()
+      if (poolSfx.clack(120, 2000) !== false) fail('专注期间撞球音不该发声')
+      if (poolSfx.rail(120) !== false) fail('专注期间撞库音不该发声')
+      if (poolSfx.cue() !== false) fail('专注期间出杆音不该发声')
+      if (poolSfx.pot() !== false) fail('专注期间落袋音不该发声')
+      if (gameSounds() !== baseGame) fail('专注期间不该有任何游戏音效发出，实得 +' + (gameSounds() - baseGame))
+      if (lsData.get('dsh-skin-im2005.poolsfx') !== sfxKeyBefore) {
+        fail('专注模式改写了游戏音效开关（串台）—— 静音必须是按时间判定，不是改开关')
+      }
+      ok('专注期间：游戏音效（撞球/撞库/出杆/落袋）全部静音，且不改写音效开关')
+    }
+
+    // ③b 本地版：提醒声（任务完成 / 需要你确认）同样被静音
     let base20 = sounds()
-    fake.running = true; await sample20(); clock20 += 3000
-    fake.running = false; await sample20()
-    if (sounds() !== base20) fail('专注期间任务完成不该提醒，实得 ' + (sounds() - base20))
-    clock20 += 3000      // 跨过 2 秒冷却，免得"没响"是被冷却拦的（那样断言会假通过）
-    fake.pendingKeys.approval = ['focus-a1']
-    await sample20()
-    if (sounds() !== base20) fail('专注期间「需要你确认」也不该提醒，实得 ' + (sounds() - base20))
-    fake.pendingKeys.approval = []
-    await sample20()
-    ok('专注期间：任务完成与「需要你确认」都不提醒')
+    if (HAS_NOTIFY) {
+      fake.running = true; await sample20(); clock20 += 3000
+      fake.running = false; await sample20()
+      if (sounds() !== base20) fail('专注期间任务完成不该提醒，实得 ' + (sounds() - base20))
+      clock20 += 3000      // 跨过 2 秒冷却，免得"没响"是被冷却拦的（那样断言会假通过）
+      fake.pendingKeys.approval = ['focus-a1']
+      await sample20()
+      if (sounds() !== base20) fail('专注期间「需要你确认」也不该提醒，实得 ' + (sounds() - base20))
+      fake.pendingKeys.approval = []
+      await sample20()
+      ok('专注期间：任务完成与「需要你确认」都不提醒（本地版提醒声也被静音）')
+    } else {
+      ok('公开版没有提醒声，这一段跳过（游戏音效已在 ③ 验证）')
+    }
 
     // ④ 到点**自动**恢复：不做任何操作，只把时间推过去
     clock20 = savedF.until + 1000
-    fake.running = true; await sample20(); clock20 += 3000
-    fake.running = false; await sample20()
-    if (sounds() - base20 !== 1) fail('专注结束后应自动恢复提醒，实得 ' + (sounds() - base20))
-    ok('专注结束 → 不需要任何操作，提醒自动恢复')
+    if (HAS_NOTIFY) {
+      fake.running = true; await sample20(); clock20 += 3000
+      fake.running = false; await sample20()
+      if (sounds() - base20 !== 1) fail('专注结束后应自动恢复提醒，实得 ' + (sounds() - base20))
+    }
+    {
+      const poolSfx2 = regs.get('im2005-pool').opts.inject().sfx
+      if (poolSfx2.clack(120, 2000) !== true) fail('专注结束后游戏音效应自动恢复发声')
+    }
+    ok('专注结束 → 不需要任何操作，声音（提醒声 + 游戏音效）自动恢复')
 
     // ⑤ 不串台：整个过程中不许改写提醒开关
-    if (lsData.get('dsh-skin-im2005.notify') !== notifyKeyBefore) {
+    if (HAS_NOTIFY && lsData.get('dsh-skin-im2005.notify') !== notifyKeyBefore) {
       fail('专注模式改写了提醒开关（串台）—— 专注结束不该顺带打开/关掉用户的提醒')
     }
     ok('专注模式不碰提醒开关（只写自己的两个键）')
@@ -3696,12 +3728,28 @@ if (!HAS_NOTIFY) {
         return (i >= 0 && j > i) ? src20.slice(i, j) : ''
       }
       const code = ['FOCUS', 'FOCUS-STORE', 'FOCUS-BUTTON', 'FOCUS-TOGGLE', 'FOCUS-VIEW'].map(region).join('\n')
-      if (!code.trim()) fail('找不到 FOCUS 标记区（标记被打掉就没法保证公开版剥干净）')
-      if (/writeNotifyFlag|NOTIFY_KEY|toggleNotify/.test(code)) {
-        fail('专注模式区域里出现了提醒开关的写入口 —— 关专注会把用户的提醒开关一起改掉')
+      if (!code.trim()) fail('找不到 FOCUS 标记区')
+      // 串台防线：专注区域里不许出现任何"改开关"的写入口（提醒 / 游戏音效都不行）
+      if (/writeNotifyFlag|NOTIFY_KEY|toggleNotify|poolSfx\.on\s*=|writeFarmSfx|poolSfx:\s*\{/.test(code)) {
+        fail('专注模式区域里出现了音效/提醒开关的写入口 —— 静音必须是按时间判定，不是改开关')
       }
-      if (!/focusActive/.test(code)) fail('专注区域里应该能看到 focusActive（提醒的唯一判据）')
-      ok('静态审计：专注区域不碰提醒开关，只读自己的状态')
+      if (!/focusActive/.test(code)) fail('专注区域里应该能看到 focusActive（所有声音入口的唯一判据）')
+      // 两个声音收口必须真的挂了时间门：以后新增音效只要走它们就自动受专注模式管
+      const gate = (fnName) => {
+        const i = src20.indexOf('const ' + fnName + ' =')
+        if (i < 0) return false
+        const body = src20.slice(i, i + 700)
+        return /focusActive\(\)/.test(body)
+      }
+      for (const fn of ['poolClack', 'poolTone']) {
+        if (!gate(fn)) fail(fn + ' 里没有专注模式的时间门 —— 游戏音效会照响')
+      }
+      // 提醒声那两处（任务完成 / 需要你确认）挂在 NOTIFY-EFFECT 区里 —— 那是本地版专属区，
+      // 公开版整块被切掉，所以这一条只在本地版检查。
+      if (HAS_NOTIFY && !/focusActive\(\)/.test(region('NOTIFY-EFFECT'))) {
+        fail('提醒声没挂专注判定（NOTIFY-EFFECT 区里看不到 focusActive）')
+      }
+      ok('静态审计：专注模式不写任何开关；两个游戏音效收口 + 提醒声都挂了时间门')
     }
   } finally {
     Date.now = realNow20
