@@ -22,7 +22,7 @@ let captured = null
 const lsData = new Map()
 // ---- 提醒的夹具：假的 DOM / MutationObserver / AudioContext ----
 // 全部在 import 之前装好，因为 plug in 的 apply() 里会立刻检查它们。
-const fake = { running: false, pending: false, pendingKeys: { approval: ['boot-1'], question: [], plan: [] }, session: 's1', scopeAlive: true, noScope: false, rafCalls: 0, moCb: null, moCbs: [], bursts: 0, tones: 0, audioPlays: 0, audioSrc: '', disconnected: 0, runEffects: false }
+const fake = { running: false, pending: false, pendingKeys: { approval: ['boot-1'], question: [], plan: [] }, waitRows: [], session: 's1', scopeAlive: true, noScope: false, rafCalls: 0, moCb: null, moCbs: [], bursts: 0, tones: 0, audioPlays: 0, audioSrc: '', disconnected: 0, runEffects: false }
 // 会话容器：isConnected 用 getter —— 要能模拟"运行中被换成别的会话（旧节点断开）"
 const scopeOf = () => ({
   get isConnected() { return fake.scopeAlive },
@@ -42,7 +42,22 @@ globalThis.document = {
   },
   // 待确认面板：客户端按 `[data-<kind>-key]` 扫全文档，并把属性值当 key 去重
   querySelectorAll: (sel) => {
-    const m = /^\[([a-z-]+)\]$/.exec(String(sel))
+    const s = String(sel)
+    // 会话列表行的"在等你"锚点：warning 圆点。夹具给每个等待行造一条
+    // 「圆点 → 行容器」的祖先链，行容器的 textContent 里带本地化状态文案。
+    // ⚠️ 对象必须**跨采样保持同一身份**（客户端按行元素去重），所以缓存在条目上。
+    if (s.indexOf('data-state="warning"') >= 0) {
+      return (fake.waitRows || []).map((r) => {
+        if (!r._dot) {
+          const row = { textContent: r.text, parentElement: null }
+          r._dot = { textContent: '', parentElement: row }
+        } else {
+          r._dot.parentElement.textContent = r.text
+        }
+        return r._dot
+      })
+    }
+    const m = /^\[([a-z-]+)\]$/.exec(s)
     if (!m) return []
     const attr = m[1]
     const kind = attr === 'data-approval-key' ? 'approval'
@@ -1203,11 +1218,68 @@ if (!HAS_NOTIFY) {
       if (!/data-approval-key/.test(src) || !/seenKeys/.test(src)) {
         fail('待确认提醒必须是"按 key 去重"的实现（缺 data-approval-key 或 seenKeys）')
       }
-      ok('待确认提醒按 key 去重（源码级检查：seenKeys 去重 + 读 data-*-key 属性值）')
-      // 收尾：把夹具恢复成"没有待确认面板"，免得影响后面的小节
+      if (!/data-state="warning"/.test(src) || !/checkRows/.test(src)) {
+        fail('缺行级信号（会话列表"在等你"的 warning 圆点）—— 那样只会在点进会话时才提醒')
+      }
+      ok('待确认提醒：面板按 key 去重 + 会话列表行级信号（源码级检查）')
+
+      // ⑨g **行级信号**：会话列表里出现"在等你"的那一行 —— 不点进去就该响。
+      //     用户实测反馈：「我要点开这个任务会话的时候才提醒」—— 因为面板只在你点进那个会话时
+      //     才挂载。列表行的状态是**所有会话**的实时状态，所以它才是"提前提醒"的那条路。
+      {
+        base = played()
+        await sample(); await sample()
+        if (played() !== base) fail('没有等待中的行时不该响')
+        clock += 3000
+        fake.waitRows = [{ text: '等待审批' }]
+        await sample()
+        if (played() - base !== 1) fail('会话列表出现"等待审批"的行应该提醒一次，实得 ' + (played() - base))
+        {
+          const t = String((walk(render(regs.get('im2005-toolbar').comp), [])[2] || {}).props?.title || '')
+          if (!/上次提醒：需要你确认（审批）/.test(t)) fail('行级提醒没写清原因，实得 ' + JSON.stringify(t))
+        }
+        ok('会话列表出现「在等你」的行 -> 不点进去就提醒（行级信号）')
+
+        // 同一行继续等：反复采样不响
+        base = played()
+        for (let i = 0; i < 3; i++) { clock += 1000; await sample() }
+        if (played() !== base) fail('同一行一直在等，不该反复响')
+        ok('同一行持续等待 -> 不重复响')
+
+        // 行级已经报过之后，再点进会话让面板挂载 -> 不响（防"列表响一声、点进去又响一声"）
+        base = played()
+        clock += 3000
+        fake.pendingKeys.approval = ['a9']
+        await sample()
+        if (played() !== base) fail('行级已经报过，点进会话挂载同一个面板不该再响')
+        ok('行级报过之后再点进会话 -> 面板不再重复响')
+
+        // 回答完（行消失）→ 再来一个新请求 → 还能响；英文文案也认
+        base = played()
+        fake.waitRows = []; fake.pendingKeys.approval = []
+        await sample()
+        clock += 3000
+        fake.waitRows = [{ text: 'Waiting for answer' }]
+        await sample()
+        if (played() - base !== 1) fail('回答完再来一个新请求应该重新提醒，实得 ' + (played() - base))
+        ok('一轮结束后再来新请求 -> 恢复提醒（英文文案也认）')
+
+        // 面板兜底：列表没渲染（侧栏收起 / 窄窗）时，面板自己也要能响
+        base = played()
+        fake.waitRows = []
+        await sample()
+        clock += 3000
+        fake.pendingKeys.question = ['q7']
+        await sample()
+        if (played() - base !== 1) fail('列表没渲染时面板必须兜底提醒，实得 ' + (played() - base))
+        ok('列表没渲染（侧栏收起）-> 面板兜底提醒')
+      }
+
+      // 收尾：把夹具恢复成"没有待确认面板、没有等待中的行"，免得影响后面的小节
       fake.pendingKeys.approval = []
       fake.pendingKeys.question = []
       fake.pendingKeys.plan = []
+      fake.waitRows = []
       await sample()
       clock += 3000
     }
