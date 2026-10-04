@@ -1178,6 +1178,21 @@ window.__ModuleLoader__.load({
       setTimeout(() => { poolClack(45, 2100) }, 45)
       return poolTone(120, 0.22, 0.14)
     }
+    /* GAME-POKER-SFX:BEGIN */
+    // ---- 德州扑克音效（复用同一套 AudioContext 与合成器；开关跟"游戏音效"共用偏好）----
+    // 全部经过 poolClack / poolTone 两个收口 → 自动受专注模式的时间门管辖。
+    const pokerSfxDeal = () => (poolSfx.on ? poolClack(16, 3400) : false)
+    const pokerSfxChip = () => (poolSfx.on ? poolClack(34, 1700) : false)
+    const pokerSfxCheck = () => (poolSfx.on ? poolTone(520, 0.05, 0.05) : false)
+    const pokerSfxFold = () => (poolSfx.on ? poolTone(200, 0.06, 0.10) : false)
+    const pokerSfxPot = () => {
+      if (!poolSfx.on) return false
+      poolClack(50, 2400)
+      poolTone(660, 0.14, 0.10)
+      setTimeout(() => { poolTone(990, 0.13, 0.16) }, 110)
+      return true
+    }
+    /* GAME-POKER-SFX:END */
     /* GAME-SFX:END */
 
 
@@ -1416,6 +1431,791 @@ window.__ModuleLoader__.load({
     }
     /* GAME-MINE-ENGINE:END */
 
+    /* GAME-POKER-ENGINE:BEGIN */
+    /* 德州扑克：纯逻辑引擎（无 DOM / 无宿主依赖）
+     *
+     * 设计口径
+     *   1. 牌用两字符串表示：点数 '23456789TJQKA' + 花色 'shdc'（'As' / 'Td' / '9h'）
+     *   2. 评估器对**任意 >= 5 张**的牌组求"最好 5 张"，所以 5/6/7 张共用一条代码路径 ——
+     *      翻牌圈（5 张）、转牌圈（6 张）、河牌圈（7 张）的口径天然一致
+     *   3. 加注只有三个固定档位（半池 / 满池 / 全下），不是自由输入
+     *   4. 6 人桌；破产自动重买，所以永远不会出现"人越来越少"的分支
+     *   5. rng 可注入 —— 测试靠它固定整局牌局
+     */
+
+    const POKER = {
+      SEATS: 6,
+      SB: 10,
+      BB: 20,
+      START: 1000,
+      SIMS: 100,
+      RANKS: '23456789TJQKA',
+      SUITS: 'shdc',
+      SUIT_ZH: { s: '黑桃', h: '红桃', d: '方块', c: '梅花' },
+      NAMES: ['你', '阿豪', '小美', '老王', '阿杰', '菲菲'],
+      // 九档牌型，**按大小从高到低**排（界面上的天梯直接用它，不用再排一遍）。
+      // tie 那一列是「打平时怎么比」—— 新手输钱的主因不是记不住九档顺序，
+      // 而是不知道同档还要比踢脚（七张牌口径下一对+两对+高牌占 84.7% 的牌局）。
+      CATS: [
+        { cat: 8, zh: '同花顺', en: 'Straight Flush', tie: '比高张', note: 'A 高叫皇家同花顺' },
+        { cat: 7, zh: '四条', en: 'Four of a Kind', tie: '先比四条', note: '四张同点' },
+        { cat: 6, zh: '葫芦', en: 'Full House', tie: '先比三条', note: '三条 + 一对' },
+        { cat: 5, zh: '同花', en: 'Flush', tie: '逐张比大小', note: '五张同花色' },
+        { cat: 4, zh: '顺子', en: 'Straight', tie: '比高张', note: '五张连号' },
+        { cat: 3, zh: '三条', en: 'Three of a Kind', tie: '再比踢脚', note: '三张同点' },
+        { cat: 2, zh: '两对', en: 'Two Pair', tie: '先比大对', note: '两个对子' },
+        { cat: 1, zh: '一对', en: 'One Pair', tie: '再比踢脚', note: '两张同点' },
+        { cat: 0, zh: '高牌', en: 'High Card', tie: '逐张比大小', note: '什么都没中' },
+      ],
+      // 电脑性格：五个经典原型（数值参考休闲向 6-max 的常见区间）。
+      //   vpip        进池率（越大越松）
+      //   aggr        凶不凶（越大越爱加注）
+      //   bluff       诈唬频率 —— **刻意低于 GTO**（半池 GTO 约 25%，这里 4–32%）：
+      //               休闲玩家跟注偏松，诈唬太勤就是送钱；但**一个都不能为 0**，
+      //               否则玩家很快发现「电脑加注=真有牌」，从此逢加必弃，游戏就没了
+      //   foldToRaise 遇到加注时弃牌的倾向
+      //   callSlack   跟注门槛的宽容量（跟注站最爱跟）
+      STYLES: [
+        null,
+        { tag: '紧凶', vpip: 0.24, aggr: 1.2, bluff: 0.18, foldToRaise: 0.48, callSlack: 0.00 },
+        { tag: '跟注站', vpip: 0.45, aggr: 0.5, bluff: 0.04, foldToRaise: 0.22, callSlack: 0.12 },
+        { tag: '岩石', vpip: 0.16, aggr: 0.7, bluff: 0.06, foldToRaise: 0.60, callSlack: -0.05 },
+        { tag: '松凶', vpip: 0.38, aggr: 1.5, bluff: 0.26, foldToRaise: 0.35, callSlack: 0.02 },
+        { tag: '疯子', vpip: 0.55, aggr: 1.8, bluff: 0.32, foldToRaise: 0.15, callSlack: 0.05 },
+      ],
+    }
+
+    const pokerCat = (c) => POKER.CATS[8 - c]          // cat 8 → 索引 0
+    const pokerRankOf = (c) => 2 + POKER.RANKS.indexOf(c[0])
+    const pokerSuitOf = (c) => POKER.SUITS.indexOf(c[1])
+    const pokerLabel = (r) => POKER.RANKS[r - 2]
+    const pokerCardZh = (c) => POKER.SUIT_ZH[c[1]] + pokerLabel(pokerRankOf(c))
+
+    /** 一手牌的显示名（用评估结果拼） */
+    const pokerHandName = (h) => (h.detail ? h.zh + '（' + h.detail + '）' : h.zh)
+
+    /* ------------------------------------------------------------------ *
+     * 1) 评估器：>= 5 张牌里挑最好 5 张，返回可比大小的定级
+     * ------------------------------------------------------------------ */
+
+    /** 从点数集合里找最好的顺子；含 A-5「轮子」（A 当 1） */
+    const pokerBestStraight = (ranks) => {
+      const set = new Set(ranks)
+      const list = Array.from(set).sort((a, b) => b - a)
+      for (let i = 0; i < list.length; i++) {
+        const hi = list[i]
+        if (hi < 5) break
+        let ok = true
+        for (let k = 1; k < 5; k++) if (!set.has(hi - k)) { ok = false; break }
+        if (ok) return { high: hi, ranks: [hi, hi - 1, hi - 2, hi - 3, hi - 4] }
+      }
+      // 轮子：A 2 3 4 5，比的是"5 高"
+      if (set.has(14) && set.has(2) && set.has(3) && set.has(4) && set.has(5)) {
+        return { high: 5, ranks: [5, 4, 3, 2, 14] }
+      }
+      return null
+    }
+
+    /**
+     * @param {string[]} cards 至少 5 张
+     * @returns {{cat:number,tie:number[],best:string[],zh:string,en:string,detail:string,royal:boolean}|null}
+     *   cat 0..8（高牌 … 同花顺）；tie 是同类内逐项比较的整数序列；best 是参与比较的 5 张
+     */
+    const evaluate = (cards) => {
+      if (!cards || cards.length < 5) return null
+      const byRank = {}
+      const bySuit = {}
+      for (let i = 0; i < cards.length; i++) {
+        const c = cards[i]
+        const r = pokerRankOf(c)
+        const s = pokerSuitOf(c)
+        ;(byRank[r] || (byRank[r] = [])).push(c)
+        ;(bySuit[s] || (bySuit[s] = [])).push(c)
+      }
+      const ranksDesc = Object.keys(byRank).map(Number).sort((a, b) => b - a)
+      const mk = (cat, tie, best, detail, royal) => ({
+        cat, tie, best, detail: detail || '', royal: !!royal,
+        zh: royal ? '皇家同花顺' : pokerCat(cat).zh,
+        en: royal ? 'Royal Flush' : pokerCat(cat).en,
+      })
+      const one = (r) => byRank[r][0]
+
+      // 同花（>=5 张同花色）
+      let flushSuit = -1
+      for (const key of Object.keys(bySuit)) if (bySuit[key].length >= 5 && Number(key) > flushSuit) flushSuit = Number(key)
+
+      // ① 同花顺 / 皇家同花顺
+      if (flushSuit >= 0) {
+        const fc = bySuit[flushSuit]
+        const sf = pokerBestStraight(fc.map(pokerRankOf))
+        if (sf) {
+          const best = sf.ranks.map((r) => fc.filter((c) => pokerRankOf(c) === r)[0])
+          const detail = sf.high === 14 ? '' : pokerLabel(sf.high) + ' 到 ' + pokerLabel(sf.ranks[4])
+          return mk(8, [sf.high], best, detail || undefined, sf.high === 14)
+        }
+      }
+
+      const quads = ranksDesc.filter((r) => byRank[r].length === 4)
+      const trips = ranksDesc.filter((r) => byRank[r].length === 3)
+      const pairs = ranksDesc.filter((r) => byRank[r].length === 2)
+
+      // ② 四条
+      if (quads.length) {
+        const q = quads[0]
+        const k = ranksDesc.filter((r) => r !== q)[0]
+        return mk(7, [q, k], byRank[q].slice(0, 4).concat([one(k)]), pokerLabel(q))
+      }
+      // ③ 葫芦（两个三条时，小的那个充当对子）
+      const tripHi = trips.length ? trips[0] : -1
+      const pairHi = trips.length >= 2 ? trips[1] : (pairs.length ? pairs[0] : -1)
+      if (tripHi > 0 && pairHi > 0) {
+        return mk(6, [tripHi, pairHi],
+          byRank[tripHi].slice(0, 3).concat(byRank[pairHi].slice(0, 2)),
+          pokerLabel(tripHi) + ' 带 ' + pokerLabel(pairHi))
+      }
+      // ④ 同花（取最大的 5 张）
+      if (flushSuit >= 0) {
+        const best = bySuit[flushSuit].slice().sort((a, b) => pokerRankOf(b) - pokerRankOf(a)).slice(0, 5)
+        return mk(5, best.map(pokerRankOf), best, pokerLabel(pokerRankOf(best[0])) + ' 高')
+      }
+      // ⑤ 顺子
+      const st = pokerBestStraight(ranksDesc)
+      if (st) {
+        const best = st.ranks.map(one)
+        return mk(4, [st.high], st,
+          pokerLabel(st.high) + ' 高' + (st.high === 5 ? '（A 当 1）' : ''))
+      }
+      // ⑥ 三条
+      if (trips.length) {
+        const t = trips[0]
+        const k = ranksDesc.filter((r) => r !== t).slice(0, 2)
+        return mk(3, [t].concat(k), byRank[t].slice(0, 3).concat(k.map(one)), pokerLabel(t))
+      }
+      // ⑦ 两对
+      if (pairs.length >= 2) {
+        const p = pairs.slice(0, 2)
+        const k = ranksDesc.filter((r) => r !== p[0] && r !== p[1]).slice(0, 1)
+        return mk(2, [p[0], p[1]].concat(k),
+          byRank[p[0]].slice(0, 2).concat(byRank[p[1]].slice(0, 2), k.map(one)),
+          pokerLabel(p[0]) + ' 和 ' + pokerLabel(p[1]))
+      }
+      // ⑧ 一对
+      if (pairs.length === 1) {
+        const k = ranksDesc.filter((r) => r !== pairs[0]).slice(0, 3)
+        return mk(1, [pairs[0]].concat(k),
+          byRank[pairs[0]].slice(0, 2).concat(k.map(one)), pokerLabel(pairs[0]))
+      }
+      // ⑨ 高牌
+      const top = ranksDesc.slice(0, 5)
+      return mk(0, top, top.map(one), pokerLabel(top[0]) + ' 高')
+    }
+
+    /** 比大小：>0 表示 a 大，=0 平局 */
+    const compareHands = (a, b) => {
+      if (!a || !b) return 0
+      if (a.cat !== b.cat) return a.cat - b.cat
+      const n = Math.max(a.tie.length, b.tie.length)
+      for (let i = 0; i < n; i++) {
+        const x = a.tie[i] === undefined ? -1 : a.tie[i]
+        const y = b.tie[i] === undefined ? -1 : b.tie[i]
+        if (x !== y) return x - y
+      }
+      return 0
+    }
+
+    /**
+     * 摊牌解释：一句话说清"为什么他赢"。这是牌型辅助的核心 —— 不能只说结果。
+     * @returns {string}
+     */
+    const explainHands = (a, b, nameA, nameB) => {
+      const A = nameA || 'A'
+      const B = nameB || 'B'
+      if (!a || !b) return ''
+      if (a.cat !== b.cat) {
+        return A + ' 的' + a.zh + '大过 ' + B + ' 的' + b.zh
+      }
+      const n = Math.max(a.tie.length, b.tie.length)
+      let at = -1
+      for (let i = 0; i < n; i++) {
+        const x = a.tie[i] === undefined ? -1 : a.tie[i]
+        const y = b.tie[i] === undefined ? -1 : b.tie[i]
+        if (x !== y) { at = i; break }
+      }
+      if (at < 0) return '两家牌型完全一样，' + a.zh + '，平局分池'
+      const mine = a.tie[at]
+      const yours = b.tie[at]
+      const L = pokerLabel
+      const same = '两家都是' + a.zh
+      switch (a.cat) {
+        case 0: return same + '，逐张比大小：' + A + ' 的 ' + L(mine) + ' 比 ' + B + ' 的 ' + L(yours) + ' 大'
+        case 1: return at === 0
+          ? same + '，但 ' + A + ' 的对子是 ' + L(mine) + '，比 ' + B + ' 的 ' + L(yours) + ' 大'
+          : same + '，对子一样大，' + A + ' 的踢脚 ' + L(mine) + ' 比 ' + B + ' 的 ' + L(yours) + ' 大'
+        case 2: return at <= 1
+          ? same + '，' + A + ' 的' + (at === 0 ? '大' : '小') + '对子 ' + L(mine) + ' 比 ' + B + ' 的 ' + L(yours) + ' 大'
+          : same + '，两个对子都一样大，' + A + ' 的踢脚 ' + L(mine) + ' 比 ' + B + ' 的 ' + L(yours) + ' 大'
+        case 3: return at === 0
+          ? same + '，' + A + ' 的三条 ' + L(mine) + ' 比 ' + B + ' 的 ' + L(yours) + ' 大'
+          : same + '，三条一样大，' + A + ' 的踢脚 ' + L(mine) + ' 比 ' + B + ' 的 ' + L(yours) + ' 大'
+        case 4: return same + '，' + A + ' 的顺子是 ' + L(mine) + ' 高，' + B + ' 是 ' + L(yours) + ' 高'
+        case 5: return same + '，从大到小逐张比：' + A + ' 的 ' + L(mine) + ' 比 ' + B + ' 的 ' + L(yours) + ' 大'
+        case 6: return at === 0
+          ? same + '，' + A + ' 的三条部分是 ' + L(mine) + '，比 ' + B + ' 的 ' + L(yours) + ' 大'
+          : same + '，三条部分一样，' + A + ' 的对子 ' + L(mine) + ' 比 ' + B + ' 的 ' + L(yours) + ' 大'
+        case 7: return same + '，' + A + ' 是四条 ' + L(mine) + '，' + B + ' 是四条 ' + L(yours)
+        default: return same + '，' + A + ' 的 ' + L(mine) + ' 比 ' + B + ' 的 ' + L(yours) + ' 大'
+      }
+    }
+
+    /* ------------------------------------------------------------------ *
+     * 2) 牌堆
+     * ------------------------------------------------------------------ */
+    const pokerDeck = () => {
+      const d = []
+      for (let s = 0; s < POKER.SUITS.length; s++) {
+        for (let r = 0; r < POKER.RANKS.length; r++) d.push(POKER.RANKS[r] + POKER.SUITS[s])
+      }
+      return d
+    }
+    const pokerShuffle = (deck, rng) => {
+      for (let i = deck.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1))
+        const t = deck[i]; deck[i] = deck[j]; deck[j] = t
+      }
+      return deck
+    }
+
+    /* ------------------------------------------------------------------ *
+     * 3) 牌型辅助：起手说明 / 听牌提示
+     * ------------------------------------------------------------------ */
+    const pokerHoleNote = (cards) => {
+      if (!cards || cards.length < 2) return ''
+      const r1 = pokerRankOf(cards[0])
+      const r2 = pokerRankOf(cards[1])
+      if (r1 === r2) return '起手对子 ' + pokerLabel(r1)
+      const suited = cards[0][1] === cards[1][1]
+      const hi = Math.max(r1, r2)
+      const lo = Math.min(r1, r2)
+      const gap = hi - lo - 1
+      let t = '起手 ' + pokerLabel(hi) + pokerLabel(lo) + (suited ? ' 同花' : ' 不同花')
+      // A K 也是相邻，但玩家嘴里从不叫它「连牌」—— 只给真正的中间连张打标
+      if (gap === 0 && hi < 14) t += '（连牌）'
+      else if (gap === 1) t += '（隔一张）'
+      return t
+    }
+
+    /** 「你还差什么」：只看玩家自己看得见的牌（底牌 + 公共牌） */
+    const pokerDrawHints = (cards) => {
+      const out = []
+      if (!cards || cards.length < 4) return out
+      const bySuit = {}
+      for (const c of cards) (bySuit[c[1]] || (bySuit[c[1]] = [])).push(c)
+      const made = evaluate(cards)
+      // 同花听牌
+      for (const s of Object.keys(bySuit)) {
+        if (bySuit[s].length === 4 && !(made && made.cat >= 5)) {
+          out.push('再出一张' + POKER.SUIT_ZH[s] + '就是同花')
+        }
+      }
+      // 顺子听牌：某个「5 张连号窗口」里正好有 4 张
+      const set = new Set(cards.map(pokerRankOf))
+      const windows = []
+      for (let hi = 14; hi >= 5; hi--) windows.push([hi, hi - 1, hi - 2, hi - 3, hi - 4])
+      windows.push([5, 4, 3, 2, 14])                  // 轮子窗口：A 当 1
+      const openMiss = []
+      const gutMiss = []
+      for (const w of windows) {
+        const miss = w.filter((r) => !set.has(r))
+        if (miss.length !== 1) continue
+        const m = miss[0]
+        // 缺的是窗口两端 → 两头顺（上下两张都能成）；缺在中间 → 卡顺
+        if (m === w[0] || m === w[4]) { if (openMiss.indexOf(m) < 0) openMiss.push(m) }
+        else if (gutMiss.indexOf(m) < 0) gutMiss.push(m)
+      }
+      if (!(made && made.cat >= 4)) {
+        if (openMiss.length) out.push('两头顺：等 ' + openMiss.map(pokerLabel).join(' 或 '))
+        else if (gutMiss.length) out.push('卡顺：等 ' + pokerLabel(gutMiss[0]))
+      }
+      return out.slice(0, 2)
+    }
+
+    /* ------------------------------------------------------------------ *
+     * 4) 对局引擎
+     * ------------------------------------------------------------------ */
+    const createPokerEngine = (opts) => {
+      const o = opts || {}
+      const rng = typeof o.rng === 'function' ? o.rng : Math.random
+      const sims = o.sims || POKER.SIMS
+
+      const seats = POKER.NAMES.map((name, i) => ({
+        name, isMe: i === 0, chips: POKER.START, rebuys: 0,
+        style: POKER.STYLES[i] || POKER.STYLES[2],
+      }))
+      let st = null
+      let handNo = 0
+      let button = POKER.SEATS - 1      // 第一手庄家是座位 5，盲注落在 0/1（人类坐小盲）
+      let rebuys = 0
+
+      const potOf = () => st.p.reduce((a, p) => a + p.total, 0)
+      const liveP = () => st.p.filter((p) => !p.folded)
+      const canBetP = () => st.p.filter((p) => !p.folded && !p.allIn)
+      const toCallOf = (i) => st.curBet - st.p[i].bet
+
+      const put = (i, amount) => {
+        const pay = Math.max(0, Math.min(amount, seats[i].chips))
+        seats[i].chips -= pay
+        st.p[i].bet += pay
+        st.p[i].total += pay
+        if (seats[i].chips === 0) st.p[i].allIn = true
+        return pay
+      }
+
+      const log = (text) => { st.log.push(text); if (st.log.length > 40) st.log.shift() }
+
+      const actorAfter = (from) => {
+        for (let k = 1; k <= POKER.SEATS; k++) {
+          const i = (from + k) % POKER.SEATS
+          const p = st.p[i]
+          if (p.folded || p.allIn) continue
+          if (!p.acted || p.bet < st.curBet) return i
+        }
+        return -1
+      }
+
+      const streetZh = () => ({ preflop: '翻牌前', flop: '翻牌圈', turn: '转牌圈', river: '河牌圈', showdown: '摊牌' }[st.street] || '')
+
+      /** 发一张牌（从牌堆顶） */
+      const draw = () => {
+        const c = st.deck[st.deckAt]
+        st.deckAt++
+        return c
+      }
+
+      const newHand = () => {
+        handNo++
+        button = (button + 1) % POKER.SEATS
+        const notes = []
+        for (let i = 0; i < POKER.SEATS; i++) {
+          if (seats[i].chips < POKER.BB) {
+            seats[i].chips = POKER.START
+            seats[i].rebuys++
+            rebuys++
+            notes.push(seats[i].name + ' 输光了，自动重买 ' + POKER.START)
+          }
+        }
+        st = {
+          hand: handNo, button, street: 'preflop', board: [], curBet: POKER.BB, minRaise: POKER.BB,
+          p: [], cur: -1, log: notes, result: null, over: false, revealed: false,
+          // 外部给了牌堆就照给的顺序发（测试要能摆局），否则现洗一副
+          deck: o.deck ? o.deck.slice() : pokerShuffle(pokerDeck(), rng), deckAt: 0,
+        }
+        // 每人两张（座位顺序发；测试构造牌堆时按这个顺序）
+        for (let i = 0; i < POKER.SEATS; i++) {
+          st.p.push({ i, cards: [draw(), draw()], bet: 0, total: 0, folded: false, allIn: false, acted: false, act: '' })
+        }
+        const sb = (button + 1) % POKER.SEATS
+        const bb = (button + 2) % POKER.SEATS
+        put(sb, POKER.SB); st.p[sb].act = '小盲 ' + POKER.SB
+        put(bb, POKER.BB); st.p[bb].act = '大盲 ' + POKER.BB
+        log('—— 第 ' + handNo + ' 局开始，' + seats[button].name + ' 是庄家 ——')
+        log(seats[sb].name + ' 小盲 ' + POKER.SB + '，' + seats[bb].name + ' 大盲 ' + POKER.BB)
+        st.cur = (bb + 1) % POKER.SEATS
+        return st
+      }
+
+      const settleFold = () => {
+        const win = liveP()[0]
+        const amount = potOf()
+        seats[win.i].chips += amount
+        st.result = {
+          pots: [{ amount, elig: [win.i], main: true, winners: [win.i], hand: null }],
+          winners: [win.i],
+          lines: [seats[win.i].name + ' 没摊牌就赢下 ' + amount + '（其他人都弃牌了）'],
+          showdown: false,
+        }
+        log(seats[win.i].name + ' 赢得底池 ' + amount + '（其他人弃牌）')
+        st.over = true
+        st.street = 'showdown'
+      }
+
+      /** 边池：按各人本手总投入分层；只被一个人跟的那层原路退回 */
+      const buildPots = () => {
+        const live = liveP()
+        const caps = Array.from(new Set(live.map((p) => p.total))).sort((a, b) => a - b)
+        const pots = []
+        let prev = 0
+        let refund = 0
+        for (const cap of caps) {
+          let amount = 0
+          let contributors = 0
+          for (const p of st.p) {
+            const seg = Math.max(0, Math.min(p.total, cap) - Math.min(p.total, prev))
+            amount += seg
+            if (seg > 0) contributors++
+          }
+          const elig = live.filter((p) => p.total >= cap).map((p) => p.i)
+          if (elig.length === 1 && contributors === 1) refund += amount
+          else pots.push({ amount, elig })
+          prev = cap
+        }
+        return { pots, refund }
+      }
+
+      const showdown = () => {
+        st.street = 'showdown'
+        st.revealed = true
+        for (const p of st.p) {
+          if (!p.folded) p.hand = evaluate(p.cards.concat(st.board))
+        }
+        const { pots, refund } = buildPots()
+        const lines = []
+        const allWinners = []
+        // 退还未被跟的下注
+        let refundTo = -1
+        for (const p of st.p) if (p.total === Math.max.apply(null, liveP().map((q) => q.total))) refundTo = p.i
+        if (refund > 0) {
+          seats[refundTo].chips += refund
+          lines.push(seats[refundTo].name + ' 有一注没人跟，退回 ' + refund)
+        }
+        const potsOut = []
+        for (let k = 0; k < pots.length; k++) {
+          const pot = pots[k]
+          const cands = pot.elig.filter((i) => !st.p[i].folded)
+          if (!cands.length) continue
+          let best = cands[0]
+          for (const i of cands) if (compareHands(st.p[i].hand, st.p[best].hand) > 0) best = i
+          const winners = cands.filter((i) => compareHands(st.p[i].hand, st.p[best].hand) === 0)
+          const share = Math.floor(pot.amount / winners.length)
+          const rest = pot.amount - share * winners.length
+          // 分不尽的筹码按「从庄家左手起顺时针」的顺序多给一张
+          const ordered = winners.slice().sort((a, b) =>
+            ((a - st.button + POKER.SEATS) % POKER.SEATS) - ((b - st.button + POKER.SEATS) % POKER.SEATS))
+          for (const i of winners) seats[i].chips += share + (ordered.indexOf(i) < rest ? 1 : 0)
+          for (const i of winners) if (allWinners.indexOf(i) < 0) allWinners.push(i)
+          const title = pots.length > 1 ? (k === 0 ? '主池 ' : '边池 ' + k + ' ') : '底池 '
+          lines.push(title + pot.amount + ' → ' + winners.map((i) => seats[i].name).join('、')
+            + (winners.length > 1 ? '（平局分池）' : ''))
+          potsOut.push({ amount: pot.amount, elig: pot.elig, winners, main: k === 0, hand: st.p[best].hand })
+        }
+        // 为什么赢：冠军和最强的手下败将比一句 —— 这才是「牌型辅助」要的那句话
+        const ranked = liveP().slice().sort((a, b) => compareHands(b.hand, a.hand))
+        if (allWinners.length && ranked.length >= 2) {
+          const win = st.p[allWinners[0]]
+          const lose = ranked.filter((p) => p.i !== win.i)[0]
+          if (lose && compareHands(win.hand, lose.hand) > 0) {
+            lines.push(explainHands(win.hand, lose.hand, seats[win.i].name, seats[lose.i].name))
+          }
+        }
+        // 只有「同一个池里多家并列」才叫平局分池；两个池各有一个赢家不算
+        const split = potsOut.filter((q) => q.winners.length > 1)
+        if (split.length) lines.push('有 ' + split[0].winners.length + ' 家牌一样大，这一池平分')
+        st.result = { pots: potsOut, winners: allWinners, lines, showdown: true }
+        for (const p of st.p) p.act = p.folded ? '弃牌' : (p.hand ? pokerHandName(p.hand) : '')
+        log(lines.join('　'))
+        st.over = true
+      }
+
+      /** 一条街结束 → 下一条街；没人能再加注就直接发到底 */
+      const nextStreet = () => {
+        for (const p of st.p) { p.bet = 0; p.acted = false }
+        st.curBet = 0
+        st.minRaise = POKER.BB
+        if (st.street === 'preflop') {
+          st.street = 'flop'
+          st.board.push(draw(), draw(), draw())
+        } else if (st.street === 'flop') {
+          st.street = 'turn'
+          st.board.push(draw())
+        } else if (st.street === 'turn') {
+          st.street = 'river'
+          st.board.push(draw())
+        } else {
+          showdown()
+          return
+        }
+        log('— ' + streetZh() + '：' + st.board.join(' ') + ' —')
+        if (canBetP().length < 2) {
+          // 都全下了：不再下注，直接发完公共牌摊牌
+          while (st.board.length < 5) st.board.push(draw())
+          log('都已全下，直接发完公共牌')
+          showdown()
+          return
+        }
+        st.cur = actorAfter(st.button)
+        if (st.cur < 0) { nextStreet(); return }        // 理论上不会走到
+        if (st.cur === 0) st.p[0].acted = false          // 让界面知道轮到人
+      }
+
+      /** 动作执行完之后的推进（公共逻辑） */
+      const advance = () => {
+        if (liveP().length === 1) { settleFold(); return }
+        const nx = actorAfter(st.cur)
+        if (nx < 0) { nextStreet(); return }
+        st.cur = nx
+      }
+
+      const legalFor = (i) => {
+        if (st.over || i !== st.cur) return []
+        const need = toCallOf(i)
+        const maxTo = st.p[i].bet + seats[i].chips
+        const out = [{ id: 'fold', label: '弃牌', amount: 0 }]
+        if (need <= 0) out.push({ id: 'check', label: '过牌', amount: 0 })
+        else out.push({ id: 'call', label: '跟注 ' + Math.min(need, seats[i].chips), amount: Math.min(need, seats[i].chips) })
+        if (maxTo > st.curBet) {
+          const verb = need > 0 ? '加注到' : '下注'
+          const pre = st.street === 'preflop'
+          const pot = potOf()
+          const round = (x) => Math.round(x / 10) * 10
+          // 翻牌前锚「倍大盲」（3BB / 5BB）—— 底池只有 30，按半池加注会小到没意义；
+          // 翻牌后锚「半池 / 满池」。两档都必须 >= 最小加注额。
+          const unit = pre ? POKER.BB : pot
+          const cand = [
+            { amount: maxTo, tag: '全下', note: '全部筹码' },
+            { amount: Math.min(maxTo, st.curBet + Math.max(st.minRaise, round(unit * (pre ? 4 : 1)))), tag: verb, note: pre ? '5 倍大盲' : '一个底池' },
+            { amount: Math.min(maxTo, st.curBet + Math.max(st.minRaise, round(unit * (pre ? 2 : 0.5)))), tag: verb, note: pre ? '3 倍大盲' : '半个底池' },
+          ]
+          const seen = {}
+          const adds = []
+          for (const c of cand) {
+            if (c.amount <= st.curBet) continue
+            if (seen[c.amount]) continue
+            seen[c.amount] = 1
+            adds.push(c)
+          }
+          // 从小到大排：界面上就是「小 → 大 → 全下」，不会把全下摆在最左边
+          adds.sort((x, y) => x.amount - y.amount)
+          for (const c of adds) {
+            out.push({
+              id: 'raise', amount: c.amount, tag: c.tag, note: c.note,
+              label: (c.amount === maxTo ? '全下 ' : c.tag + ' ') + c.amount,
+            })
+          }
+        }
+        return out
+      }
+
+      const act = (a) => {
+        if (!st || st.over) return false
+        const i = st.cur
+        const p = st.p[i]
+        const need = toCallOf(i)
+        const legal = legalFor(i)
+        const okId = legal.filter((x) => x.id === a.id && (a.id !== 'raise' || x.amount === a.amount))
+        if (!okId.length) return false
+        p.acted = true
+        if (a.id === 'fold') {
+          p.folded = true
+          p.act = '弃牌'
+          log(seats[i].name + ' 弃牌')
+        } else if (a.id === 'check') {
+          p.act = '过牌'
+          log(seats[i].name + ' 过牌')
+        } else if (a.id === 'call') {
+          const pay = put(i, need)
+          p.act = p.allIn ? '全下 ' + p.total : '跟注 ' + pay
+          log(seats[i].name + (p.allIn ? ' 全下 ' + p.total : ' 跟注 ' + pay))
+        } else {
+          const was = st.curBet
+          const pay = put(i, a.amount - p.bet)
+          const to = p.bet
+          st.minRaise = Math.max(POKER.BB, to - was)
+          st.curBet = Math.max(st.curBet, to)
+          p.act = p.allIn ? '全下 ' + p.total : (was > 0 ? '加注到 ' + to : '下注 ' + to)
+          log(seats[i].name + ' ' + p.act)
+          for (const q of st.p) if (q.i !== i && !q.folded && !q.allIn) q.acted = false
+          void pay
+        }
+        advance()
+        return true
+      }
+
+      /* ---- 电脑对手 ---- */
+
+      /**
+       * 蒙特卡洛胜率：**只喂自己的底牌 + 公共牌**，对手一律按随机牌模拟。
+       * 也就是说这个函数在数据结构上就"看不到"别人的底牌 —— 电脑不可能开挂。
+       * 每次决策跑 SIMS 次（默认 100，实测单次约 1.5 ms，够快；300 次会踩 5 ms 线）。
+       */
+      const equity = (i, oppCount) => {
+        const known = st.p[i].cards.concat(st.board)
+        const boardNeed = 5 - st.board.length
+        if (oppCount <= 0) return 1
+        let score = 0
+        const pool = pokerDeck().filter((c) => known.indexOf(c) < 0)
+        const need = oppCount * 2 + boardNeed
+        const oppHands = []
+        for (let k = 0; k < oppCount; k++) oppHands.push(new Array(2))
+        for (let n = 0; n < sims; n++) {
+          // 部分洗牌：只洗出需要的张数
+          for (let k = 0; k < need; k++) {
+            const j = k + Math.floor(rng() * (pool.length - k))
+            const t = pool[k]; pool[k] = pool[j]; pool[j] = t
+          }
+          const extra = pool.slice(oppCount * 2, need)
+          const mySeven = known.concat(extra)
+          const mine = evaluate(mySeven)
+          let best = 0
+          let tieWith = 0
+          for (let k = 0; k < oppCount; k++) {
+            const seven = [pool[k * 2], pool[k * 2 + 1]].concat(extra)
+            const c = compareHands(evaluate(seven), mine)
+            if (c > 0) { best = -1; break }
+            if (c === 0) tieWith++
+          }
+          if (best === 0 && tieWith === 0) score += 1
+          else if (best === 0) score += 1 / (tieWith + 1)
+        }
+        return score / sims
+      }
+
+      /**
+       * 下注尺度：**按金额**认档位（不能按数组下标 —— legalFor 里全下是第一个压进去的），
+       * 越强下得越重；只有短码或极强才推全下，否则电脑会退化成"见人就梭"。
+       */
+      const pickRaise = (raises, strength, aggr, pot, stack) => {
+        const sorted = raises.slice().sort((a, b) => a.amount - b.amount)
+        const all = sorted[sorted.length - 1]
+        const big = sorted.length > 1 ? sorted[sorted.length - 2] : all
+        const small = sorted[0]
+        const short = stack <= pot * 1.5 || stack <= POKER.BB * 5
+        if (strength > 0.90 + (1 - aggr) * 0.05) return short ? all : big
+        if (strength > 0.72) return big
+        return small
+      }
+
+      const botDecide = (i) => {
+        const p = st.p[i]
+        const style = seats[i].style
+        const need = toCallOf(i)
+        const maxTo = p.bet + seats[i].chips
+        const pot = potOf()
+        const opps = liveP().length - 1
+        // 胜率**只喂自己的底牌 + 公共牌**，对手一律当随机牌 —— 电脑物理上拿不到别人的底牌
+        const eq = equity(i, Math.max(1, opps))
+        // 位置：越靠后（庄家最后行动）越敢玩 —— 6-max 里性价比最高的一条权重
+        const pos = (i - st.button + POKER.SEATS) % POKER.SEATS / POKER.SEATS
+        const potOdds = need > 0 ? need / (pot + need) : 0
+        // 随机抖动（越浪抖得越大）：没有它，电脑会"精确得像开挂"
+        const swing = (rng() - 0.5) * (0.04 + style.bluff * 0.08)
+        const strength = eq + swing + pos * 0.03
+        // 是不是正面对着"有人加过注"（而不是只跟一个大盲）
+        const raised = need > 0 && st.curBet > (st.street === 'preflop' ? POKER.BB : 0)
+        const legal = legalFor(i)
+        const raises = legal.filter((x) => x.id === 'raise')
+
+        if (need <= 0) {
+          const betThresh = 0.50 + 0.12 * (1.5 - Math.min(1.5, style.aggr)) / 1.5 + 0.05 * (1 - style.vpip)
+          if (strength > betThresh && raises.length) {
+            return pickRaise(raises, strength, style.aggr, pot, seats[i].chips)
+          }
+          // 诈唬支：少了这一支，玩家很快学会"没人下注就是都没牌"
+          if (rng() < style.bluff * 0.5 && raises.length) return raises[0]
+          const chk = legal.filter((x) => x.id === 'check')[0]
+          return chk || legal[0]
+        }
+        const callThresh = potOdds + 0.02 + 0.10 * (1 - style.vpip) - 0.05 * style.aggr
+          + (raised ? 0.10 * style.foldToRaise : 0) - 0.10 * style.callSlack
+        if (strength > callThresh + 0.20 && raises.length && rng() < Math.min(0.9, 0.30 + style.aggr * 0.35)) {
+          return pickRaise(raises, strength, style.aggr, pot, seats[i].chips)
+        }
+        if (strength >= callThresh) return legal.filter((x) => x.id === 'call')[0] || legal[0]
+        // 偶尔"飘"一下：用弱牌跟一注，免得弃牌率被玩家读死
+        if (rng() < style.bluff * 0.18) return legal.filter((x) => x.id === 'call')[0] || legal[0]
+        return legal[0]   // 弃牌
+      }
+
+      const step = () => {
+        if (!st || st.over) return false
+        if (st.cur <= 0) return false        // 座位 0 是人，等界面点
+        return act(botDecide(st.cur))
+      }
+
+      const snapshot = () => {
+        if (!st) return null
+        const i = 0
+        const known = st.p[i].cards.concat(st.board)
+        const hand = st.board.length >= 3 ? evaluate(known) : null
+        const meLive = !st.p[i].folded
+        return {
+          hand: st.hand, street: st.street, streetZh: streetZh(), board: st.board.slice(),
+          pot: potOf(), curBet: st.curBet, cur: st.cur, over: st.over, button: st.button,
+          myTurn: !st.over && st.cur === i,
+          seats: st.p.map((p) => ({
+            i: p.i, name: seats[p.i].name, isMe: p.i === i, chips: seats[p.i].chips,
+            bet: p.bet, total: p.total, folded: p.folded, allIn: p.allIn, act: p.act,
+            dealer: st.button === p.i,
+            cards: (st.revealed && !p.folded) || p.i === i ? p.cards.slice() : [],
+            hand: st.revealed && !p.folded ? p.hand : null,
+            style: seats[p.i].style ? seats[p.i].style.tag : '',
+          })),
+          me: {
+            cards: st.p[i].cards.slice(), hand,
+            handName: hand ? pokerHandName(hand) : '',
+            note: st.board.length >= 3 ? '' : pokerHoleNote(st.p[i].cards),
+            hints: pokerDrawHints(known),
+            need: toCallOf(i), legal: legalFor(i), live: meLive,
+          },
+          ladder: POKER.CATS.map((c) => ({
+        cat: c.cat, zh: c.zh, en: c.en, tie: c.tie, note: c.note,
+        active: !!hand && hand.cat === c.cat,
+      })),
+          log: st.log.slice(-6),
+          result: st.result,
+        }
+      }
+
+      const serialize = () => ({
+        v: 1, handNo, button, rebuys,
+        chips: seats.map((s) => s.chips),
+        st: st ? {
+          hand: st.hand, street: st.street, board: st.board, curBet: st.curBet, minRaise: st.minRaise,
+          cur: st.cur, log: st.log, over: st.over, revealed: st.revealed, deckAt: st.deckAt,
+          // 只存牌堆剩下的部分（足够复原；整副存也就 52 项，干脆整存，省得对不上）
+          deck: st.deck,
+          p: st.p.map((p) => ({ cards: p.cards, bet: p.bet, total: p.total, folded: p.folded, allIn: p.allIn, acted: p.acted, act: p.act })),
+          result: st.result,
+        } : null,
+      })
+
+      const restore = (sv) => {
+        if (!sv || typeof sv !== 'object' || sv.v !== 1) return false
+        if (!Array.isArray(sv.chips) || sv.chips.length !== POKER.SEATS) return false
+        if (sv.chips.some((c) => !Number.isFinite(c) || c < 0)) return false
+        handNo = sv.handNo | 0
+        button = sv.button | 0
+        rebuys = sv.rebuys | 0
+        for (let i = 0; i < POKER.SEATS; i++) seats[i].chips = sv.chips[i]
+        const s = sv.st
+        if (!s) { st = null; return true }
+        if (!Array.isArray(s.deck) || s.deck.length !== 52) return false
+        if (!Array.isArray(s.p) || s.p.length !== POKER.SEATS) return false
+        st = {
+          hand: s.hand, button, street: s.street, board: s.board.slice(), curBet: s.curBet,
+          minRaise: s.minRaise, cur: s.cur, log: (s.log || []).slice(), over: !!s.over,
+          revealed: !!s.revealed, deck: s.deck.slice(), deckAt: s.deckAt,
+          p: s.p.map((p, i) => ({
+            i, cards: p.cards.slice(), bet: p.bet, total: p.total, folded: !!p.folded,
+            allIn: !!p.allIn, acted: !!p.acted, act: p.act || '', hand: null,
+          })),
+          result: s.result || null,
+        }
+        // 摊牌局面读回来要能重建手牌名（否则界面上写着牌型却算不出来）
+        if (st.revealed) for (const p of st.p) if (!p.folded) p.hand = evaluate(p.cards.concat(st.board))
+        return true
+      }
+
+      return {
+        POKER, seats, newHand, act, step, snapshot, serialize, restore,
+        actor: () => (st ? st.cur : -1),
+        over: () => !!st && st.over,
+        state: () => st,
+        legal: () => legalFor(st ? st.cur : -1),
+        botDecide, equity, pot: potOf,
+        totalChips: () => seats.reduce((a, s) => a + s.chips, 0),
+        rebuys: () => rebuys,
+      }
+    }
+    /* GAME-POKER-ENGINE:END */
     /* GAME-MINE-STORE:BEGIN */
     const MINE_KEY = 'dsh-skin-im2005.mine'
     const MINE_BEST_KEY = 'dsh-skin-im2005.minebest'
@@ -2049,6 +2849,35 @@ window.__ModuleLoader__.load({
     const writePoolSize = (k) => {
       try { window.localStorage.setItem(POOL_SIZE_KEY, String(POOL_VIEW.clampK(k))) } catch (err) {}
     }
+    /* GAME-POKER-STORE:BEGIN */
+    // ---- 德州扑克：存档 / 窗口位置 ----
+    // 局面就是一小段 JSON（牌堆 + 每人投入 + 公共牌），所以"随时暂停"照旧 = "随时序列化"。
+    // 不存"窗口开着没开着"：跟八球/扫雷一致，重开应用不自己弹窗。
+    const POKER_SAVE_KEY = 'dsh-skin-im2005.poker'
+    const POKER_POS_KEY = 'dsh-skin-im2005.pokerpos'
+    const readPokerSave = () => {
+      try {
+        const raw = window.localStorage.getItem(POKER_SAVE_KEY)
+        if (!raw) return null
+        const obj = JSON.parse(raw)
+        return obj && typeof obj === 'object' ? obj : null
+      } catch (err) { return null }
+    }
+    const writePokerSave = (obj) => {
+      try { window.localStorage.setItem(POKER_SAVE_KEY, JSON.stringify(obj)); return true } catch (err) { return false }
+    }
+    const clearPokerSave = () => { try { window.localStorage.removeItem(POKER_SAVE_KEY) } catch (err) {} }
+    const readPokerPos = () => {
+      try {
+        const o = JSON.parse(window.localStorage.getItem(POKER_POS_KEY) || 'null')
+        if (o && typeof o.x === 'number' && typeof o.y === 'number' && isFinite(o.x) && isFinite(o.y)) return o
+      } catch (err) {}
+      return null
+    }
+    const writePokerPos = (pos) => {
+      try { window.localStorage.setItem(POKER_POS_KEY, JSON.stringify({ x: pos.x, y: pos.y })) } catch (err) {}
+    }
+    /* GAME-POKER-STORE:END */
     /* GAME-STORE:END */
 
 
@@ -2092,6 +2921,11 @@ window.__ModuleLoader__.load({
       farmNote: '',
       taskOpen: false,
       farmSfx: false,
+      /* GAME-POKER-UI-STORE:BEGIN */
+      // 德州扑克：窗口开关 / 按钮 tooltip 上的说明
+      pokerOpen: false,
+      pokerNote: '',
+      /* GAME-POKER-UI-STORE:END */
       /* GAME-UI-STORE:END */
       balance: { open: false, state: 'idle', amount: '', note: '' },
       // 账户头像 URL（来自一方 getProfile 接口，和界面左下角那个圆形头像同源）
@@ -2563,6 +3397,16 @@ window.__ModuleLoader__.load({
               writeFarmOpen(on)
             } catch (err) {}
           }),
+        /* GAME-POKER-BUTTON:BEGIN */
+        // 德州扑克：6 人桌，跟 5 个电脑打。**牌型辅助**常驻在窗口右侧：
+        // 九档天梯（当前牌型高亮）+ 你现在是什么牌 + 摊牌时逐条讲为什么输赢。
+        // 位置：和另外三个游戏挨着（后台任务不是游戏，所以排在它前面）。
+        btn('poker', '德州扑克',
+          '德州扑克（6 人桌，跟 5 个电脑打）：右侧常驻牌型大小天梯，随时显示你现在是什么牌、'
+          + '摊牌时说明为什么输赢；筹码独立，输光自动重买'
+          + (s.pokerNote ? '\n' + s.pokerNote : ''),
+          () => { try { store.set({ pokerOpen: !s.pokerOpen, pokerNote: '' }) } catch (err) {} }),
+        /* GAME-POKER-BUTTON:END */
         // 后台任务监控：**纯被动** —— 点按钮才开窗，平时界面上没有任何标记，跑完也不提醒
         btn('tasks', '后台任务',
           '后台任务：点开才看，列出正在跑的会话（用时/子代理/工具调用/计划任务）。平时不显示任何标记，跑完也不会响。',
@@ -5013,6 +5857,475 @@ window.__ModuleLoader__.load({
       }, rows)
     }
     /* GAME-MINE-VIEW:END */
+    /* GAME-POKER-VIEW:BEGIN */
+    const POKER_VIEW = (() => {
+      const pad = 6
+      const main = 452
+      const side = 196
+      const botW = 84
+      const botH = 76
+      const cardW = 32
+      const cardH = 44
+      const bigW = 42
+      const bigH = 58
+      const titleH = 30
+      const actH = 30
+      const logH = 34
+      const tableH = pad * 2 + botH + 6 + cardH + 6 + bigH + 6 + actH + logH
+      return {
+        pad, main, side, botW, botH, cardW, cardH, bigW, bigH, titleH, actH, logH, tableH,
+        winW: main + side + 2, winH: titleH + tableH,
+      }
+    })()
+
+    const POKER_SUIT_CH = { s: '♠', h: '♥', d: '♦', c: '♣' }
+    const POKER_RED_SUIT = { h: 1, d: 1 }
+
+    /** 一张扑克牌。card 传空串 = 牌背（对手没亮牌 / 公共牌还没发）。 */
+    const ImPokerCard = (props) => {
+      const c = props.card
+      const w = props.w || POKER_VIEW.cardW
+      const hh = props.h || POKER_VIEW.cardH
+      const back = !c
+      const suit = back ? '' : c[1]
+      const st = {
+        width: w, height: hh, boxSizing: 'border-box', borderRadius: 3, flex: '0 0 auto',
+        border: '1px solid ' + (back ? '#123c66' : '#8c8c8c'),
+        background: back
+          ? 'repeating-linear-gradient(45deg,#3d6ea8,#3d6ea8 3px,#5b8cc4 3px,#5b8cc4 6px)'
+          : '#ffffff',
+        color: POKER_RED_SUIT[suit] ? '#c0392b' : '#1a1a1a',
+        font: 'bold ' + Math.round(hh * 0.32) + 'px/1.05 Tahoma, SimSun, serif',
+        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+        userSelect: 'none', pointerEvents: 'none', textAlign: 'center',
+      }
+      if (props.mark) {
+        // 参与比大小的那 5 张（7 选 5 的结果）单独标出来，让"哪 5 张在比"看得见
+        st.boxShadow = '0 0 0 2px #ffd54d'
+        st.border = '1px solid #b8860b'
+      }
+      if (back) return h('div', { className: 'dsh-skin-im2005-card is-back', style: st })
+      return h('div', {
+        className: 'dsh-skin-im2005-card', 'data-card': c,
+        title: (props.title || pokerCardZh(c)) + (props.mark ? '　★ 参与比大小的 5 张' : ''),
+        style: st,
+      }, [
+        h('span', { key: 'r' }, c[0]),
+        h('span', { key: 's', style: { fontSize: Math.round(hh * 0.26), lineHeight: 1 } }, POKER_SUIT_CH[suit] || ''),
+      ])
+    }
+
+    let POKER_ENG = null            // 模块级会话：窗口关掉再开，这一局还在
+
+    const ImPokerWindow = (props) => {
+      const s = useStore()
+      const save = props.save || { read: readPokerSave, write: writePokerSave }
+      const posStore = props.pos || { read: readPokerPos, write: writePokerPos }
+      const makeEngine = (props.engine && props.engine.create) || createPokerEngine
+      const boot = React.useRef(null)
+      const dragWin = React.useRef(null)
+      const tickRef = React.useRef(0)
+      const mounted = React.useRef(true)
+
+      if (!boot.current) {
+        let eng = POKER_ENG
+        let resumed = false
+        if (eng) {
+          const cur = eng.state()
+          resumed = !!(cur && !cur.over)
+        } else {
+          eng = makeEngine({})
+          const sv = save.read()
+          if (sv && eng.restore(sv)) {
+            const cur = eng.state()
+            resumed = !!(cur && !cur.over)
+          }
+          if (!resumed) eng.newHand()
+          POKER_ENG = eng
+        }
+        boot.current = { eng, resumed }
+      }
+      const eng = boot.current.eng
+      // 每次渲染都从引擎现取局面：**引擎是唯一真源**，界面只是它的投影。
+      // 不把快照塞进 useState —— 那样测试（或任何外部）直接推进局面时，界面会一直显示过期数据。
+      const [, bump] = React.useState(0)
+      const [min, setMin] = React.useState(false)
+      const winW = POKER_VIEW.winW
+      const winH = min ? POKER_VIEW.titleH : POKER_VIEW.winH
+      const clampPos = (x, y, hgt) => {
+        const vw = globalThis.innerWidth || 1200
+        const vh = globalThis.innerHeight || 800
+        const H = hgt || winH
+        return {
+          x: Math.max(0, Math.min(Math.max(0, vw - winW), x)),
+          y: Math.max(0, Math.min(Math.max(0, vh - H), y)),
+        }
+      }
+      // 默认落在右上角（球桌在右下、扫雷在左下，三个都开着也不叠）
+      const defaultPos = () => clampPos(Math.max(16, (globalThis.innerWidth || 1200) - winW - 24), 96)
+      const [pos, setPos] = React.useState(() => {
+        const p = posStore.read() || defaultPos()
+        return clampPos(p.x, p.y)
+      })
+
+      const sync = () => {
+        try { save.write(eng.serialize()) } catch (err) {}
+        bump((n) => n + 1)            // 触发重渲染；重渲染时才会重新 snapshot
+      }
+      const stopTick = () => {
+        if (!tickRef.current) return
+        try { clearTimeout(tickRef.current) } catch (err) {}
+        tickRef.current = 0
+      }
+      const sfxOn = () => { poolSfx.on = s.poolSfx !== false; return poolSfx.on }
+      // 电脑一步一步来：每 400ms 出一个动作。一次梭哈到底会看不清发生了什么。
+      const scheduleTick = (delay) => {
+        stopTick()
+        tickRef.current = setTimeout(() => {
+          tickRef.current = 0
+          if (!mounted.current) return
+          const cur = eng.state()
+          if (!cur || cur.over || eng.actor() === 0) { sync(); return }
+          const who = eng.actor()
+          const chipsBefore = cur.p[who].chips
+          const moved = eng.step()
+          if (moved) {
+            sfxOn()
+            const nx = eng.state()
+            if (nx.over) pokerSfxPot()
+            else if (nx.street !== cur.street) pokerSfxDeal()
+            else if (nx.p[who].chips < chipsBefore) pokerSfxChip()
+            else pokerSfxCheck()
+          }
+          sync()
+          const after = eng.state()
+          if (after && !after.over && eng.actor() > 0) scheduleTick(400)
+        }, delay)
+      }
+      const doAct = (a) => () => {
+        const streetBefore = eng.state().street
+        if (!eng.act(a)) return
+        sfxOn()
+        if (a.id === 'fold') pokerSfxFold()
+        else if (a.id === 'check') pokerSfxCheck()
+        else pokerSfxChip()
+        sync()
+        const cur = eng.state()
+        if (cur.over) pokerSfxPot()
+        else if (cur.street !== streetBefore) pokerSfxDeal()
+        if (!cur.over && eng.actor() > 0) scheduleTick(420)
+      }
+      const nextHand = () => {
+        eng.newHand()
+        sfxOn()
+        pokerSfxDeal()
+        sync()
+        if (eng.actor() > 0) scheduleTick(320)
+      }
+
+      React.useEffect(() => () => { mounted.current = false; stopTick() }, [])
+      React.useEffect(() => {
+        if (s.pokerOpen && !eng.over() && eng.actor() > 0) scheduleTick(320)
+        return stopTick
+      }, [s.pokerOpen])
+
+      const onTitleDown = (ev) => {
+        const t = ev && ev.target
+        if (t && typeof t.closest === 'function' && t.closest('button,[data-nodrag]')) return
+        dragWin.current = { dx: ev.clientX - pos.x, dy: ev.clientY - pos.y }
+        if (ev && ev.currentTarget && typeof ev.currentTarget.setPointerCapture === 'function' && ev.pointerId !== undefined) {
+          try { ev.currentTarget.setPointerCapture(ev.pointerId) } catch (err) {}
+        }
+      }
+      const onTitleMove = (ev) => {
+        if (!dragWin.current) return
+        setPos(clampPos(ev.clientX - dragWin.current.dx, ev.clientY - dragWin.current.dy))
+      }
+      const onTitleUp = () => {
+        if (!dragWin.current) return
+        dragWin.current = null
+        setPos((cur) => {
+          const fixed = clampPos(cur.x, cur.y)
+          try { posStore.write(fixed) } catch (err) {}
+          return fixed
+        })
+      }
+      const onTitleDouble = () => {
+        const dp = defaultPos()
+        setPos(dp)
+        try { posStore.write(dp) } catch (err) {}
+      }
+
+      // 关掉窗口就整个不渲染（和八球/扫雷一致）
+      if (!s.pokerOpen) return null
+
+      const hud = eng.snapshot()
+
+      const face = faceOf(s.scheme)
+      const btnStyle = {
+        border: '1px solid ' + IM_EDGE, background: 'linear-gradient(#ffffff,#e6eef8)', color: '#1a1a1a',
+        font: '11px/1.5 SimSun, serif', padding: '2px 8px', cursor: 'pointer', pointerEvents: 'auto',
+      }
+      const titleBtn = Object.assign({}, btnStyle, {
+        background: 'rgba(255,255,255,0.18)', color: '#fff',
+        border: '1px solid rgba(255,255,255,0.45)', padding: '0 6px',
+      })
+      const curName = hud.cur >= 0 && hud.seats[hud.cur] ? hud.seats[hud.cur].name : ''
+
+      const seatTile = (seat) => {
+        const shown = seat.cards && seat.cards.length === 2
+        const dim = seat.folded
+        const third = hud.over
+          ? (seat.folded ? '弃牌' : (seat.hand ? pokerHandName(seat.hand) : (seat.allIn ? '全下' : '')))
+          : (seat.bet > 0 ? '下注 ' + seat.bet : (seat.allIn ? '全下' : ''))
+        return h('div', {
+          key: 'seat' + seat.i,
+          className: 'dsh-skin-im2005-poker-seat' + (hud.cur === seat.i && !hud.over ? ' is-turn' : ''),
+          title: seat.name + (seat.style ? '（打法：' + seat.style + '）' : '') + '：筹码 ' + seat.chips
+            + (seat.bet > 0 ? '，本轮已下 ' + seat.bet : '')
+            + (seat.folded ? '（已弃牌）' : seat.allIn ? '（已全下）' : ''),
+          style: {
+            width: POKER_VIEW.botW, height: POKER_VIEW.botH, boxSizing: 'border-box',
+            border: '1px solid ' + (hud.cur === seat.i && !hud.over ? '#ffd54d' : 'rgba(255,255,255,0.35)'),
+            background: dim ? 'rgba(0,0,0,0.30)' : 'rgba(255,255,255,0.10)',
+            borderRadius: 3, padding: '2px 3px', display: 'flex', flexDirection: 'column',
+            alignItems: 'center', overflow: 'hidden', opacity: dim ? 0.6 : 1,
+          },
+        }, [
+          h('div', {
+            key: 'n',
+            style: { display: 'flex', alignItems: 'center', gap: 3, color: '#fff', font: 'bold 11px/1.25 SimSun, serif', height: 15, overflow: 'hidden' },
+          }, [
+            seat.dealer
+              ? h('span', { key: 'd', title: '庄家（小盲在大盲左边，庄家最后行动）', style: { background: '#ffd54d', color: '#5a3d00', borderRadius: 8, padding: '0 3px', fontSize: 9 } }, '庄')
+              : null,
+            seat.name,
+          ]),
+          h('div', { key: 'c', style: { color: '#ffe9a8', font: '10px/1.3 SimSun, serif', height: 14, overflow: 'hidden' } }, '筹码 ' + seat.chips),
+          h('div', { key: 'b', style: { color: '#cfe6ff', font: '10px/1.3 SimSun, serif', height: 14, overflow: 'hidden' } }, third),
+          h('div', { key: 'cards', style: { display: 'flex', gap: 2, marginTop: 'auto' } },
+            shown
+              ? seat.cards.map((c, k) => h(ImPokerCard, { key: 'k' + k, card: c, w: 24, h: 30 }))
+              : (seat.folded ? [] : [
+                h(ImPokerCard, { key: 'b1', card: '', w: 24, h: 30 }),
+                h(ImPokerCard, { key: 'b2', card: '', w: 24, h: 30 }),
+              ])),
+        ])
+      }
+
+      // 7 选 5 的结果：这 5 张才是真正拿去比大小的
+      const inBest = (c) => !!(hud.me.hand && hud.me.hand.best && hud.me.hand.best.indexOf(c) >= 0)
+
+      const boardRow = h('div', {
+        key: 'board',
+        style: { display: 'flex', alignItems: 'center', gap: 5, height: POKER_VIEW.cardH },
+      }, [
+        h('div', {
+          key: 'pot', className: 'dsh-skin-im2005-poker-pot',
+          title: '底池：这一局所有人已经投进去的筹码',
+          style: { width: 62, flex: '0 0 auto', color: '#fff', font: '10px/1.3 SimSun, serif', textAlign: 'center' },
+        }, [
+          h('div', { key: 't', style: { fontSize: 9, color: '#bfe0c8' } }, '底池'),
+          h('div', { key: 'v', style: { fontWeight: 'bold', fontSize: 13, color: '#ffe9a8' } }, String(hud.pot)),
+        ]),
+      ].concat(
+        (function () {
+          const out = []
+          for (let k = 0; k < 5; k++) {
+            if (k < hud.board.length) out.push(h(ImPokerCard, { key: 'b' + k, card: hud.board[k], mark: inBest(hud.board[k]) }))
+            else out.push(h('div', {
+              key: 'e' + k,
+              style: {
+                width: POKER_VIEW.cardW, height: POKER_VIEW.cardH, boxSizing: 'border-box', flex: '0 0 auto',
+                border: '1px dashed rgba(255,255,255,0.35)', borderRadius: 3,
+              },
+            }))
+          }
+          return out
+        })(),
+        [h('div', {
+          key: 'st',
+          style: { flex: '1 1 auto', textAlign: 'right', color: '#dff0e4', font: '10px/1.3 SimSun, serif' },
+        }, hud.streetZh + '　第 ' + hud.hand + ' 局')],
+      ))
+
+      const meRow = h('div', {
+        key: 'me', className: 'dsh-skin-im2005-poker-mine',
+        style: { display: 'flex', alignItems: 'center', gap: 8, height: POKER_VIEW.bigH },
+      }, [
+        h('div', { key: 'cards', style: { display: 'flex', gap: 3 } },
+          hud.me.cards.map((c, k) => h(ImPokerCard, { key: 'm' + k, card: c, w: POKER_VIEW.bigW, h: POKER_VIEW.bigH, mark: inBest(c) }))),
+        h('div', { key: 'info', style: { flex: '1 1 auto', minWidth: 0, color: '#fff', font: '11px/1.4 SimSun, serif' } }, [
+          h('div', { key: 'h', style: { fontWeight: 'bold', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+            hud.me.hand ? '你：' + hud.me.handName : (hud.me.note || '')),
+          h('div', { key: 's', style: { color: '#cfe6ff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+            hud.seats[0].folded ? '你已弃牌，这一局交出去了'
+              : (hud.me.hints.length
+                ? hud.me.hints.join('　')
+                : (hud.board.length < 5
+                  ? hud.streetZh + '，还会再发 ' + (5 - hud.board.length) + ' 张公共牌'
+                  : '五张公共牌发完了，这就是你最后的牌型'))),
+          h('div', { key: 'c', style: { color: '#ffe9a8' } },
+            '筹码 ' + hud.seats[0].chips + (hud.me.need > 0 && !hud.over ? '　需跟 ' + hud.me.need : '')),
+        ]),
+      ])
+
+      const actBtn = (a, k) => h('button', {
+        key: 'a' + k, type: 'button', className: 'dsh-skin-im2005-poker-act',
+        'data-act': a.id + (a.amount ? ':' + a.amount : ''),
+        title: (a.note ? a.note + '　' : '') + a.label,
+        onClick: doAct(a),
+        style: Object.assign({}, btnStyle, {
+          padding: '3px 9px', flexShrink: 0,
+          fontWeight: a.id === 'fold' ? 'normal' : 'bold',
+          background: a.id === 'raise'
+            ? 'linear-gradient(#fff3c4,#ffdf7a)'
+            : (a.id === 'fold' ? 'linear-gradient(#ffffff,#e6eef8)' : 'linear-gradient(#ffffff,#d8e8ff)'),
+        }),
+      }, a.label)
+
+      const actRow = hud.over
+        ? h('div', {
+          key: 'act', className: 'dsh-skin-im2005-poker-act-row',
+          style: { display: 'flex', alignItems: 'center', gap: 6, height: POKER_VIEW.actH, color: '#fff', font: '11px/1.4 SimSun, serif' },
+        }, [
+          h('span', {
+            key: 'r',
+            style: { flex: '1 1 auto', minWidth: 0, fontWeight: 'bold', color: '#ffe9a8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+          }, hud.result && hud.result.lines.length ? hud.result.lines[0] : '本局结束'),
+          h('button', {
+            key: 'next', type: 'button', title: '收好筹码，开下一局（庄家轮转）',
+            onClick: nextHand,
+            style: Object.assign({}, btnStyle, { background: 'linear-gradient(#fff3c4,#ffdf7a)', fontWeight: 'bold', flexShrink: 0 }),
+          }, '下一局'),
+        ])
+        : (hud.myTurn
+          ? h('div', {
+            key: 'act', className: 'dsh-skin-im2005-poker-act-row',
+            style: { display: 'flex', alignItems: 'center', gap: 5, height: POKER_VIEW.actH },
+          }, hud.me.legal.map(actBtn))
+          : h('div', {
+            key: 'act', className: 'dsh-skin-im2005-poker-act-row',
+            style: { display: 'flex', alignItems: 'center', height: POKER_VIEW.actH, color: '#dff0e4', font: '11px/1.4 SimSun, serif' },
+          }, hud.me.live ? '等 ' + curName + ' 行动…' : '你已弃牌，等这一局打完'))
+
+      const logLines = hud.over && hud.result ? hud.result.lines.slice(1, 3) : hud.log.slice(-2)
+      const logRow = h('div', {
+        key: 'log', className: 'dsh-skin-im2005-poker-log',
+        style: {
+          height: POKER_VIEW.logH, boxSizing: 'border-box', padding: '3px 6px', borderRadius: 3,
+          background: 'rgba(0,0,0,0.22)', color: '#e6f2e8', font: '10px/1.45 SimSun, serif', overflow: 'hidden',
+        },
+      }, logLines.length
+        ? logLines.map((t, k) => h('div', {
+          key: 'l' + k, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+        }, t))
+        : [h('div', { key: 'l0' }, '点按钮出手；右侧天梯随时对照牌型大小')])
+
+      const tiers = hud.ladder.map((r) => h('div', {
+        key: 't' + r.cat,
+        className: 'dsh-skin-im2005-poker-tier' + (r.active ? ' is-active' : ''),
+        'data-cat': r.cat,
+        title: r.zh + ' / ' + r.en + (r.note ? '　—— ' + r.note : ''),
+        style: {
+          display: 'flex', alignItems: 'baseline', gap: 4, padding: '0 5px', height: 17, boxSizing: 'border-box',
+          background: r.active ? '#ffe98a' : 'transparent',
+          borderBottom: '1px dotted #c2d3e6',
+          fontWeight: r.active ? 'bold' : 'normal',
+          color: r.active ? '#7a4a00' : '#24456e',
+          font: '11px/1.6 SimSun, serif',
+        },
+      }, [
+        h('span', { key: 'z', style: { flex: '0 0 40px' } }, r.zh),
+        h('span', {
+          key: 'tie', title: r.zh + '：' + r.tie,
+          style: { flex: '0 0 62px', fontSize: 9, color: r.active ? '#7a4a00' : '#5b6f88', overflow: 'hidden', whiteSpace: 'nowrap' },
+        }, r.tie),
+        h('span', {
+          key: 'e',
+          style: { flex: '1 1 auto', minWidth: 0, fontSize: 9, color: r.active ? '#8a6a20' : '#93a4b8', overflow: 'hidden', whiteSpace: 'nowrap' },
+        }, r.en),
+      ]))
+
+      const sideCol = h('div', {
+        key: 'side', className: 'dsh-skin-im2005-poker-ladder',
+        style: {
+          width: POKER_VIEW.side, boxSizing: 'border-box', borderLeft: '1px solid ' + IM_EDGE,
+          background: '#eef3fb', paddingTop: 4, display: 'flex', flexDirection: 'column',
+        },
+      }, [
+        h('div', {
+          key: 'h',
+          style: { padding: '0 6px 3px', font: 'bold 11px/1.4 SimSun, serif', color: IM_BLUE_DEEP },
+        }, '牌型大小（上大下小）'),
+        h('div', {
+          key: 'h2',
+          style: { padding: '0 6px 3px', font: '9px/1.35 SimSun, serif', color: '#5b6f88' },
+        }, '高亮行 = 你现在最好的一手；中列 = 打平时怎么比'),
+      ].concat(tiers, [h('div', {
+        key: 'f',
+        style: { padding: '4px 6px', font: '9px/1.4 SimSun, serif', color: '#66788c', borderTop: '1px solid ' + IM_EDGE, marginTop: 'auto' },
+      }, 'A 高同花顺 = 皇家同花顺；同档比点数，点数一样再比踢脚')]))
+
+      const titleRow = h('div', {
+        key: 'title',
+        onPointerDown: onTitleDown, onPointerMove: onTitleMove, onPointerUp: onTitleUp,
+        onDoubleClick: onTitleDouble,
+        title: '拖动移动；双击回到默认位置（窗口只能留在应用窗口内 —— 浮层出不去）',
+        style: {
+          display: 'flex', alignItems: 'center', gap: 6, padding: '0 4px 0 7px', cursor: 'move',
+          height: POKER_VIEW.titleH, boxSizing: 'border-box', overflow: 'hidden',
+          background: IM_BLUE, color: '#ffffff', font: 'bold 12px/1.6 SimSun, serif',
+          borderTopLeftRadius: 3, borderTopRightRadius: 3, pointerEvents: 'auto',
+        },
+      }, [
+        h('span', { key: 't', style: { flex: '1 1 auto' } }, '德州扑克　第 ' + hud.hand + ' 局'),
+        s.poolHint
+          ? h('span', {
+            key: 'hint', 'data-nodrag': '1',
+            title: 'AI 回复完成了 —— 窗口不动，你自己决定什么时候看',
+            onClick: () => store.set({ poolHint: '' }),
+            style: { cursor: 'pointer', color: '#ffe14d', fontSize: 11 },
+          }, s.poolHint + ' ✕')
+          : null,
+        h('button', {
+          key: 'min', type: 'button', title: min ? '还原牌桌' : '收起成一条标题栏（这一局保留）',
+          onClick: () => { try { save.write(eng.serialize()) } catch (err) {}; setMin(!min) },
+          style: titleBtn,
+        }, min ? '▣' : '─'),
+        h('button', {
+          key: 'x', type: 'button', title: '关闭牌桌（先存盘，下次点「德州扑克」接着打）',
+          onClick: () => { try { save.write(eng.serialize()) } catch (err) {}; store.set({ pokerOpen: false, poolHint: '' }) },
+          style: titleBtn,
+        }, '✕'),
+      ])
+
+      return h('div', {
+        className: 'dsh-skin-im2005-poker',
+        style: {
+          position: 'fixed', left: pos.x, top: pos.y, width: winW,
+          background: face, border: '1px solid ' + IM_EDGE_STRONG, boxShadow: '2px 3px 10px rgba(0,0,0,0.35)',
+          zIndex: POOL_VIEW.z, pointerEvents: 'none', borderRadius: 4,
+        },
+      }, [
+        titleRow,
+        min ? null : h('div', { key: 'body', style: { display: 'flex', pointerEvents: 'auto' } }, [
+          h('div', {
+            key: 'table',
+            style: {
+              width: POKER_VIEW.main, boxSizing: 'border-box', padding: POKER_VIEW.pad,
+              background: '#1e6b46', display: 'flex', flexDirection: 'column', gap: 6,
+            },
+          }, [
+            h('div', { key: 'seats', style: { display: 'flex', gap: 2, justifyContent: 'space-between' } },
+              hud.seats.filter((x) => !x.isMe).map(seatTile)),
+            boardRow, meRow, actRow, logRow,
+          ]),
+          sideCol,
+        ]),
+      ])
+    }
+    /* GAME-POKER-VIEW:END */
 
 
     const ImShowColumn = () => {
@@ -5665,7 +6978,8 @@ window.__ModuleLoader__.load({
             if (wasRunning && !running) {
               // 农场的"完成轮次"驱动：和闪提示共用同一个信号（不另开观察器），内部自带节流
               try { farmOnTurn() } catch (err) {}
-              if (store.poolOpen) store.set({ poolHint: '任务完成 · 回来看 →' })
+              // 三个游戏共用一个提示字段：窗口开着才闪（不开的窗口让它安安静静）
+              if (store.poolOpen || store.mineOpen || store.pokerOpen) store.set({ poolHint: '任务完成 · 回来看 →' })
             }
             wasRunning = running
           }
@@ -5773,6 +7087,25 @@ window.__ModuleLoader__.load({
               view: MINE_VIEW,
             }),
           }],
+          /* GAME-POKER-REG:BEGIN */
+          // 德州扑克（浮层）。引擎/存档/位置/音效全走 inject —— 回归测试与界面走同一条路径。
+          // live() 是给测试留的口子：拿到模块级那一个真引擎，好把电脑的动作一步步推完。
+          ['shell.overlay', 'im2005-poker', ImPokerWindow, {
+            inject: () => ({
+              engine: { create: createPokerEngine, POKER, live: () => POKER_ENG },
+              evaluate,
+              compareHands,
+              explainHands,
+              pokerHoleNote,
+              pokerDrawHints,
+              pokerCardZh,
+              save: { read: readPokerSave, write: writePokerSave, clear: clearPokerSave },
+              pos: { read: readPokerPos, write: writePokerPos },
+              view: POKER_VIEW,
+              sfx: { deal: pokerSfxDeal, chip: pokerSfxChip, pot: pokerSfxPot },
+            }),
+          }],
+          /* GAME-POKER-REG:END */
           ['shell.overlay', 'im2005-pool', ImPoolWindow, {
             inject: () => ({
               engine: { create: createPoolEngine, POOL },

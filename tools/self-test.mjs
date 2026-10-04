@@ -498,6 +498,7 @@ const HAS_MINE = labels.some((l) => String(l).includes('扫雷'))
 const HAS_NOTE = labels.some((l) => String(l).includes('跨会话备注框'))
 const HAS_FARM = labels.some((l) => String(l).includes('Token农场'))
 const HAS_TASKS = labels.some((l) => String(l).includes('后台任务'))
+const HAS_POKER = labels.some((l) => String(l).includes('德州扑克'))
 const HAS_FOCUS = labels.some((l) => String(l).includes('专注模式'))
 if (!labels.some((l) => String(l).includes('余额'))) fail('缺少余额按钮，实得 ' + JSON.stringify(labels))
 if (!labels.some((l) => String(l).includes('形象秀'))) fail('缺少 形象秀固定按钮，实得 ' + JSON.stringify(labels))
@@ -506,9 +507,10 @@ if (!HAS_MINE) fail('缺少「扫雷」按钮，实得 ' + JSON.stringify(labels
 if (!HAS_NOTE) fail('缺少「跨会话备注框」按钮，实得 ' + JSON.stringify(labels))
 if (!HAS_FARM) fail('缺少「Token农场」按钮，实得 ' + JSON.stringify(labels))
 if (!HAS_TASKS) fail('缺少「后台任务」按钮，实得 ' + JSON.stringify(labels))
+if (!HAS_POKER) fail('缺少「德州扑克」按钮（两个版本都应带），实得 ' + JSON.stringify(labels))
 if (HAS_NOTIFY && !HAS_FOCUS) fail('本地版应带「专注模式」按钮（与提醒功能同生共死），实得 ' + JSON.stringify(labels))
 {
-  const want = 2 + (HAS_NOTIFY ? 1 : 0) + (HAS_FOCUS ? 1 : 0) + (HAS_POOL ? 1 : 0) + (HAS_MINE ? 1 : 0) + (HAS_NOTE ? 1 : 0) + (HAS_FARM ? 1 : 0) + (HAS_TASKS ? 1 : 0)
+  const want = 2 + (HAS_NOTIFY ? 1 : 0) + (HAS_FOCUS ? 1 : 0) + (HAS_POOL ? 1 : 0) + (HAS_MINE ? 1 : 0) + (HAS_NOTE ? 1 : 0) + (HAS_FARM ? 1 : 0) + (HAS_TASKS ? 1 : 0) + (HAS_POKER ? 1 : 0)
   if (toolBtns.length !== want) fail('工具条按钮数应为 ' + want + '，实际 ' + toolBtns.length)
   // 顺序也要钉住：备注框排在「提醒声」之后、「美式八球」之前（用户指定）
   {
@@ -533,6 +535,10 @@ if (HAS_NOTIFY && !HAS_FOCUS) fail('本地版应带「专注模式」按钮（�
     if (!(at('跨会话备注框') < at('美式八球'))) fail('备注框应排在美式八球之前，实得 ' + JSON.stringify(labels))
     if (!(at('Token农场') > at('扫雷'))) fail('农场应排在扫雷之后，实得 ' + JSON.stringify(labels))
     if (!(at('后台任务') > at('Token农场'))) fail('后台任务应排在 Token农场 右边，实得 ' + JSON.stringify(labels))
+    // 德州扑克是游戏，用户要求它和另外三个游戏挨着（后台任务不是游戏，所以排在它之前）
+    if (!(at('德州扑克') >= 0)) fail('找不到德州扑克按钮')
+    if (!(at('德州扑克') > at('Token农场'))) fail('德州扑克应排在 Token农场 右边，实得 ' + JSON.stringify(labels))
+    if (!(at('德州扑克') < at('后台任务'))) fail('德州扑克应排在「后台任务」左边（跟游戏挨着），实得 ' + JSON.stringify(labels))
   }
 }
 ok(toolBtns.length + ' 个按钮: ' + JSON.stringify(labels))
@@ -3754,6 +3760,286 @@ console.log('\n=== 20. 专注模式：设定时长 / 期间不响任何声音 / 
   } finally {
     Date.now = realNow20
     globalThis.setInterval = realSetInterval20
+  }
+}
+
+console.log('\n=== 21. 德州扑克：九档牌型辅助 + 6 人桌对局 + 摊牌解释 ===')
+{
+  const injP = regs.get('im2005-poker').opts.inject()
+  const PV = injP.view
+  const mkP = injP.engine.create
+  const POKER = injP.engine.POKER
+  const ev = injP.evaluate
+  const cmp = injP.compareHands
+  const say = injP.explainHands
+  const lcg = (seed) => () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+
+  const walkP = (n, out, d) => {
+    const dd = d || 0
+    if (!n || typeof n !== 'object' || dd > 18) return out
+    if (typeof n.type === 'function') {
+      try { return walkP(instantiate(n.type, n.props), out, dd + 1) } catch (e) { fail('扑克窗口渲染抛错: ' + e.message) }
+    }
+    out.push(n)
+    ;(n.children || []).forEach((c) => walkP(c, out, dd + 1))
+    return out
+  }
+  const txtP = (n, d) => {
+    const dd = d || 0
+    if (dd > 18 || n === null || n === undefined || n === false) return ''
+    if (typeof n === 'string' || typeof n === 'number') return String(n)
+    if (Array.isArray(n)) return n.map((x) => txtP(x, dd + 1)).join(' ')
+    if (typeof n.type === 'function') { try { return txtP(instantiate(n.type, n.props), dd + 1) } catch (e) { return '' } }
+    let o = ''
+    ;(n.children || []).forEach((c) => { o += ' ' + txtP(c, dd + 1) })
+    return o
+  }
+
+  // ① 评估器：牌型定级 + 九档里最容易写错的边界（含 6/7 张才出现的"双三条=葫芦"）
+  {
+    const cases = [
+      [['As', 'Ks', 'Qs', 'Js', 'Ts', '2d', '3c'], 8, 14, '皇家同花顺（cat 仍是同花顺 8）'],
+      [['As', '2s', '3s', '4s', '5s', 'Kd', 'Qc'], 8, 5, '轮子同花顺（高张是 5，不是 A）'],
+      [['Ah', 'Ad', 'Ac', 'As', 'Kd', 'Qc', '2h'], 7, 14, '四条 A'],
+      [['5d', '5h', '5s', '6d', '6h', '6s', '8c'], 6, 6, '双三条 → 葫芦取大的三条（5 张牌穷举测不出来）'],
+      [['Ah', 'Ad', 'Ac', 'Kh', 'Kd', 'Qc', '2h'], 6, 14, '葫芦 A 带 K'],
+      [['2h', '5h', '9h', 'Jh', 'Kh', 'Ah', '3c'], 5, 14, '六张同花只取最大 5 张'],
+      [['As', '2h', '3d', '4c', '5s', 'Kd', '9h'], 4, 5, '轮子顺子 A2345'],
+      [['As', 'Kh', 'Qd', 'Jc', '2s', '3d', '4h'], 0, 14, 'A K Q J 2 不是顺子（A 不能两头都占）'],
+      [['As', '2h', '3d', '4c', '6s', 'Kd', '9h'], 0, 14, 'A2346 不是顺子'],
+      [['Ah', 'Ad', 'Kh', 'Qd', 'Jc', '2c', '3h'], 1, 14, '一对 A'],
+    ]
+    for (const [cards, cat, top, why] of cases) {
+      const h = ev(cards)
+      if (!h) fail(why + '：评估返回空')
+      if (h.cat !== cat) fail(why + '：牌型级应为 ' + cat + '，实得 ' + h.cat + '（' + h.zh + '）')
+      if (h.tie[0] !== top) fail(why + '：第一比较项应为 ' + top + '，实得 ' + h.tie[0])
+    }
+    if (ev(['Ah', 'Ad', 'Ac', 'As', 'Kd', 'Qc', '2h']).best.length !== 5) fail('best 必须是 5 张')
+    if (ev(['2h', '5h', '9h', 'Jh', 'Kh', 'Ah', '3c']).best.indexOf('2h') >= 0) fail('六张同花该丢掉最小的 2h')
+    ok('扑克评估器：' + cases.length + ' 组牌型/边界全部定级正确（含轮子、双三条、公共牌成牌）')
+  }
+
+  // ② 比大小 + 摊牌解释（"为什么输"必须说人话）
+  {
+    const s = (a, b) => Math.sign(cmp(ev(a), ev(b)))
+    if (s(['Jh', 'Jd', 'Jc', 'Js', '9s', 'Ks', '7d'], ['Jh', 'Jd', 'Jc', 'Js', '9s', 'Qs', 'Td']) !== 1) fail('四条踢脚 K 应胜 Q')
+    if (s(['Jh', 'Jd', 'Jc', 'Js', '9s', '8s', '2d'], ['Jh', 'Jd', 'Jc', 'Js', '9s', '6s', '5d']) !== 0) fail('公共牌四条 + 9，两家应平局')
+    if (s(['Js', 'Jh', '2d', '2c', '4s', 'Kd', '9h'], ['Ts', 'Th', '9d', '9c', '8s', 'Ad', 'Kh']) !== 1) fail('两对应先比大对（JJ22 > TT99）')
+    if (s(['8s', '8h', '6d', '6c', '3s', '2d', '5h'], ['8d', '8c', '5d', '5c', 'Ks', 'Qh', 'Jd']) !== 1) fail('两对应先比小对（8866 > 8855，踢脚 K 不算）')
+    if (s(['Kh', 'Qs', '9s', '5s', '3s', '2s', '2h'], ['Kh', 'Qs', '9s', '5s', '3s', '2s', '2d']) !== 0) fail('同花优先于一对')
+    const t1 = say(ev(['Ah', 'Ad', 'Kh', 'Qd', 'Jc', '2c', '3h']), ev(['As', 'Ac', 'Kh', 'Qd', 'Tc', '2c', '3h']), '你', '阿豪')
+    if (!/踢脚/.test(t1)) fail('同对子不同踢脚要说「踢脚」，实得：' + t1)
+    const t2 = say(ev(['2h', '3d', 'As', 'Ks', 'Qs', 'Js', 'Ts']), ev(['2c', '2d', 'As', 'Ks', 'Qs', 'Js', 'Ts']), '你', '小美')
+    if (!/平局/.test(t2)) fail('公共牌就是最好牌要说平局，实得：' + t2)
+    const t3 = say(ev(['Ah', 'Ad', 'Ac', 'As', 'Kd', 'Qc', '2h']), ev(['Kh', 'Kd', 'Kc', 'Qh', 'Qd', '2c', '3h']), '你', '老王')
+    if (!/大过/.test(t3)) fail('不同牌型要说「X 大过 Y」，实得：' + t3)
+    ok('扑克比大小与摊牌解释：踢脚 / 平局 / 牌型压制三种说法都对')
+  }
+
+  // ③ 牌型辅助的文本层：起手说明 + 听牌提示（只报"还差什么"，不报没前提的胜率数字）
+  {
+    const hn = injP.pokerHoleNote(['As', 'Ks'])
+    if (!/同花/.test(hn)) fail('AK 同花起手说明不对，实得：' + hn)
+    if (/胜率|%/.test(hn)) fail('起手说明里不该出现胜率数字（没前提的概率会制造"作弊感"）')
+    const d1 = injP.pokerDrawHints(['As', 'Ks', '2s', '7s', '3d'])
+    if (!d1.some((x) => /同花/.test(x))) fail('四张黑桃应提示同花听牌，实得 ' + JSON.stringify(d1))
+    const d2 = injP.pokerDrawHints(['9h', '8d', '7c', '6s', '2d'])
+    if (!d2.some((x) => /两头顺/.test(x))) fail('9876 应提示两头顺，实得 ' + JSON.stringify(d2))
+    const d3 = injP.pokerDrawHints(['9h', '8d', '6c', '5s', '2d'])
+    if (!d3.some((x) => /卡顺/.test(x))) fail('9865 应提示卡顺，实得 ' + JSON.stringify(d3))
+    ok('牌型辅助：起手说明（无胜率数字）+ 同花/两头顺/卡顺提示')
+  }
+
+  // ④ 电脑不许看别人的牌：把对手底牌整个换掉，胜率必须一模一样
+  {
+    const e1 = mkP({ rng: lcg(7), sims: 30 })
+    const e2 = mkP({ rng: lcg(7), sims: 30 })
+    e1.newHand(); e2.newHand()
+    // 座位 2..5 的底牌对调（座位 1 的底牌与公共牌完全不动）
+    const st2 = e2.state()
+    const tmp = st2.p[2].cards.slice()
+    st2.p[2].cards = st2.p[3].cards.slice()
+    st2.p[3].cards = tmp
+    const a = e1.equity(1, 4)
+    const b = e2.equity(1, 4)
+    if (a !== b) fail('胜率受了别人底牌的影响 —— 电脑能看到别人的牌（开挂）。' + a + ' vs ' + b)
+    ok('电脑胜率只吃「自己的底牌 + 公共牌」：把对手底牌对调，结果一模一样（物理上开不了挂）')
+  }
+
+  // ⑤ 引擎：随机 12 局全部收束、动作合法、筹码守恒（重买另算）
+  {
+    const e = mkP({ rng: lcg(20261004), sims: 20 })
+    let show = 0
+    for (let hand = 0; hand < 12; hand++) {
+      const before = e.totalChips()
+      const rb = e.rebuys()
+      e.newHand()
+      let guard = 0
+      while (!e.over() && guard++ < 400) {
+        const i = e.actor()
+        if (i < 0) break
+        const legal = e.legal()
+        if (!legal.length) fail('轮到座位 ' + i + ' 却没有任何合法动作')
+        const act = i === 0
+          ? (legal.find((x) => x.id === 'call') || legal.find((x) => x.id === 'check') || legal[0])
+          : e.botDecide(i)
+        if (!e.act(act)) fail('合法动作被拒：' + JSON.stringify(act))
+        if (e.seats.some((s) => s.chips < 0)) fail('筹码变负')
+      }
+      if (guard >= 400) fail('第 ' + hand + ' 局没收敛（死循环）')
+      if (e.state().result && e.state().result.showdown) show++
+      if (e.totalChips() !== before + (e.rebuys() - rb) * POKER.START) {
+        fail('第 ' + hand + ' 局筹码不守恒：' + before + ' → ' + e.totalChips())
+      }
+    }
+    ok('扑克引擎：12 局随机对局全部收束、动作合法、筹码一分不差（' + show + ' 次摊牌）')
+  }
+
+  // ⑥ 存档往返（"随时能停"= 随时序列化）
+  {
+    const e = mkP({ rng: lcg(3), sims: 20 })
+    e.newHand(); e.step(); e.step()
+    const sv = JSON.parse(JSON.stringify(e.serialize()))
+    const e2 = mkP({ rng: lcg(9), sims: 20 })
+    if (!e2.restore(sv)) fail('自己的扑克存档应能读回')
+    if (JSON.stringify(e2.snapshot()) !== JSON.stringify(e.snapshot())) fail('读回后的界面数据应与存档前一致')
+    if (e2.restore({ v: 2 })) fail('版本号不认识应拒绝')
+    if (e2.restore({ v: 1, chips: [1, 2] })) fail('座位数不对应拒绝')
+    ok('扑克存档：局面往返一致；版本不对 / 座位数不对一律拒绝')
+  }
+
+  // ⑦ 浮窗：不点不渲染 → 点按钮开窗 → 天梯 9 档（高到低）+ 当前牌型高亮 + 最佳 5 张高亮
+  {
+    const comp = regs.get('im2005-poker').comp
+    // 界面用的那个引擎拿的是 **Math.random** —— 先把随机源换成固定种子，
+    // 这一节才完全可复现（否则每跑一次牌面都不同，断言会随牌飘）
+    const realRandomP = Math.random
+    Math.random = lcg(20261004)
+    const inst = (extra) => instantiate(comp, Object.assign({}, injP, extra || {}))
+    if (walkP(inst(), []).length) fail('没点按钮前不该渲染任何节点')
+    const pBtn = walk(instantiate(regs.get('im2005-toolbar').comp), [])
+      .find((b) => b.type === 'button' && JSON.stringify(b.children || '').includes('德州扑克'))
+    if (!pBtn) fail('工具条里找不到「德州扑克」按钮')
+    pBtn.props.onClick()
+    const tree = walkP(inst(), [])
+    const box = tree.find((n) => n.props && n.props.className === 'dsh-skin-im2005-poker')
+    if (!box) fail('点了按钮后应出现牌桌浮窗')
+    if (!(box.props.style.zIndex > 2000000000)) fail('牌桌层级应压过普通界面')
+
+    const tiers = tree.filter((n) => n.props && String(n.props.className || '').indexOf('dsh-skin-im2005-poker-tier') === 0)
+    if (tiers.length !== 9) fail('牌型天梯应是 9 档（皇家同花顺算同花顺的特例，不单列第 10 档），实得 ' + tiers.length)
+    if (!/同花顺/.test(txtP(tiers[0])) || !/Straight Flush/.test(txtP(tiers[0]))) fail('天梯第一档应是同花顺，实得 ' + txtP(tiers[0]))
+    if (!/高牌/.test(txtP(tiers[8]))) fail('天梯最后一档应是高牌，实得 ' + txtP(tiers[8]))
+    if (/皇家同花顺/.test(tiers.map((t) => txtP(t)).join(' '))) fail('天梯里不该把皇家同花顺当成独立一档')
+    // 「打平时怎么比」那一列：新手真正会输钱的地方
+    if (!/先比大对/.test(txtP(tiers.find((t) => /两对/.test(txtP(t)))))) fail('两对那一档要写明「先比大对」')
+    if (!/再比踢脚/.test(txtP(tiers.find((t) => /一对/.test(txtP(t)))))) fail('一对那一档要写明「再比踢脚」')
+
+    const eng = injP.engine.live()
+    if (!eng || !eng.state()) fail('inject 的 live() 应能拿到界面正在用的那个引擎')
+    // 把电脑推到人类行动，界面上才该出现动作按钮
+    let g = 0
+    while (!eng.over() && eng.actor() !== 0 && g++ < 200) eng.step()
+    if (eng.actor() !== 0) fail('推不到人类行动（actor=' + eng.actor() + '）')
+    const t2 = walkP(inst(), [])
+    const acts = t2.filter((n) => n.props && n.props.className === 'dsh-skin-im2005-poker-act')
+    if (!acts.length) fail('轮到人类时应有动作按钮')
+    if (!acts.some((b) => /弃牌/.test(txtP(b)))) fail('动作里必须有弃牌：' + JSON.stringify(acts.map((b) => txtP(b))))
+    if (!acts.some((b) => /跟注|过牌/.test(txtP(b)))) fail('动作里必须有跟注或过牌')
+    if (!acts.some((b) => b.props['data-act'] === 'raise' || /加注到|下注/.test(txtP(b)))) fail('动作里必须有下注/加注档位')
+    const potNode = t2.find((n) => n.props && n.props.className === 'dsh-skin-im2005-poker-pot')
+    if (!potNode) fail('牌桌上应显示底池')
+    ok('扑克浮窗：不点不渲染；点开有 9 档天梯（含「打平时怎么比」列）、底池、动作按钮')
+
+    // 打完整一局：一路跟/过到底。万一这一局全弃了（没摊牌），就再开一局重试 ——
+    // 一直到"真的走到摊牌"为止，这样下面的界面断言跟运气无关。
+    const drive = () => {
+      let h = 0
+      while (!eng.over() && h++ < 400) {
+        if (eng.actor() === 0) {
+          const legal = eng.legal()
+          const pick = legal.find((x) => x.id === 'call') || legal.find((x) => x.id === 'check') || legal[0]
+          if (!eng.act(pick)) fail('人类的合法动作被拒：' + JSON.stringify(pick))
+        } else if (!eng.step()) break
+      }
+      if (!eng.over()) fail('这一局没打完')
+    }
+    let tries = 0
+    while (tries++ < 10) {
+      drive()
+      const sn = eng.state()
+      if (sn.result && sn.result.showdown && sn.board.length === 5) break
+      eng.newHand()
+    }
+    const fin = eng.snapshot()
+    if (fin.board.length !== 5) fail('河牌圈后公共牌应是 5 张，实得 ' + fin.board.length)
+    const t3 = walkP(inst(), [])
+    const cardsShown = t3.filter((n) => n.props && n.props['data-card']).length
+    if (cardsShown < 5 + 5) fail('摊牌时该亮出公共牌 5 张 + 至少 5 家底牌，实得 ' + cardsShown + ' 张')
+    const all3 = txtP(inst())
+    if (!/下一局/.test(all3)) fail('一局结束应出现「下一局」按钮')
+    if (!/→|赢/.test(all3)) fail('结算行应说明筹码归谁，实得 ' + JSON.stringify(all3.slice(0, 160)))
+    const rl = (fin.result && fin.result.lines) || []
+    if (fin.result && fin.result.showdown) {
+      // 摊牌不能只报"筹码归谁"，还必须说清"为什么" —— 这正是牌型辅助的核心
+      const why = rl.filter((t) => !/→|退回/.test(t))
+      if (!why.length) fail('摊牌要有一句为什么赢/为什么平，实得 ' + JSON.stringify(rl))
+      if (!/大过|平局|一样大|逐张|比/.test(why[0])) fail('摊牌解释读不出比较关系，实得 ' + JSON.stringify(why))
+      if (!/你|阿豪|小美|老王|阿杰|菲菲/.test(why[0])) fail('摊牌解释里该出现名字，实得 ' + JSON.stringify(why))
+    }
+    const reveals = fin.seats.filter((s) => !s.folded && s.cards.length === 2)
+    if (reveals.length < 2) fail('摊牌时没弃牌的座位都该亮牌，实得 ' + reveals.length)
+    for (const s of reveals) if (!s.hand) fail('亮牌的座位都要能算出牌型（' + s.name + '）')
+    // 最佳 5 张高亮：7 选 5 的结果必须正好 5 张（把规则变成看得见的）
+    const marks = t3.filter((n) => n.props && n.props.style && n.props.style.boxShadow === '0 0 0 2px #ffd54d')
+    if (marks.length !== 5) fail('河牌圈应高亮正好 5 张参与比大小的牌，实得 ' + marks.length)
+    ok('扑克摊牌：公共牌 5 张 + 各家亮牌与牌型名 + 筹码归属 + 一句人话解释；最佳 5 张正好高亮 5 张')
+
+    // 下一局：局数 +1、底池回到盲注量级、关窗先存盘
+    const handBefore = eng.state().hand
+    const nextBtn = walkP(inst(), []).find((n) => n.type === 'button' && /下一局/.test(txtP(n)))
+    if (!nextBtn) fail('找不到「下一局」按钮')
+    nextBtn.props.onClick()
+    const e2 = injP.engine.live()
+    if (e2.state().hand !== handBefore + 1) fail('点「下一局」应开新的一局')
+    const saved = lsData.get('dsh-skin-im2005.poker')
+    if (!saved) fail('每步都该写盘（随时能停 = 随时序列化）')
+    const sv2 = JSON.parse(saved)
+    if (sv2.v !== 1 || !Array.isArray(sv2.chips) || sv2.chips.length !== POKER.SEATS) fail('存档结构不对：' + saved.slice(0, 80))
+    const closeBtn = walkP(inst(), []).find((n) => n.type === 'button' && /✕/.test(txtP(n)))
+    if (!closeBtn) fail('牌桌标题栏应有 ✕')
+    closeBtn.props.onClick()
+    if (walkP(inst(), []).length) fail('关掉之后不该再渲染')
+    ok('扑克：下一局开新局、每步写盘、关窗即收起（局面留在存档里）')
+    Math.random = realRandomP
+  }
+
+  // ⑧ 静态审计：牌桌不许碰提醒功能（公开版会整块剥掉），音效只能走两个收口
+  {
+    const srcP = fs.readFileSync('dsh-skin-im2005/client.js', 'utf8')
+    const region = (tag) => {
+      const a = srcP.indexOf('/* ' + tag + ':BEGIN */')
+      const b = srcP.indexOf('/* ' + tag + ':END */')
+      if (a < 0 || b < 0) fail('client.js 缺少 ' + tag + ' 标记区')
+      return srcP.slice(a, b)
+    }
+    const all = ['GAME-POKER-ENGINE', 'GAME-POKER-STORE', 'GAME-POKER-SFX', 'GAME-POKER-VIEW', 'GAME-POKER-BUTTON', 'GAME-POKER-REG']
+      .map(region).join('\n')
+    // 只看代码，不看注释 —— 和 make-public 的残留检查同一口径
+    // （注释里出现 AudioContext / 提醒 这类词是无害的，拿它判失败会误报）
+    const stripC = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n').filter((L) => !/^\s*(\/\/|\*)/.test(L)).join('\n')
+    const allCode = stripC(all)
+    for (const re of [/提醒/, /playCough/, /createNotifier/, /toggleNotify/, /NOTIFY/, /store\.notify/]) {
+      if (re.test(allCode)) fail('牌桌区域里出现了提醒功能的引用（' + re + '）—— 公开版会整块剥掉，会直接报未定义')
+    }
+    const sfx = region('GAME-POKER-SFX')
+    if (!/poolClack/.test(sfx) || !/poolTone/.test(sfx)) fail('扑克音效必须走 poolClack / poolTone 两个收口（专注模式才管得住）')
+    if (/AudioContext|createOscillator|createBufferSource/.test(stripC(sfx))) fail('扑克音效不许绕过两个收口自己造声音（专注模式会漏音）')
+    if (!/poolSfx\.on/.test(sfx)) fail('扑克音效要认「游戏音效」开关')
+    if (!/engine\.POKER|POKER/.test(region('GAME-POKER-REG'))) fail('注册项应把引擎通过 inject 交出去（测试与界面走同一条路径）')
+    ok('静态审计：牌桌不碰提醒功能；音效只走两个收口、认游戏音效开关、受专注模式时间门管辖')
   }
 }
 
