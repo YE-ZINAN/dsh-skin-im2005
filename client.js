@@ -2398,7 +2398,6 @@ window.__ModuleLoader__.load({
           s.pinned ? '形象秀 面板已固定（点击取消，面板可以收起）' : '点击固定 形象秀 面板',
           () => { try { if (s.togglePin) s.togglePin() } catch (err) {} }, s.pinned),
         
-        
         /* GAME-BUTTON:BEGIN */
         // 跨会话备注框：所有会话共用一块草稿纸。用户要求它排在「提醒按钮」和美式八球之间
         // —— 三个游戏/工具里它最"日常"，放前面。（措辞避开提醒功能的关键词：
@@ -2443,6 +2442,7 @@ window.__ModuleLoader__.load({
             } catch (err) {}
           }),
         /* GAME-BUTTON:END */
+        
       )
     }
 

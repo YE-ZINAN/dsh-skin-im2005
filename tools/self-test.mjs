@@ -517,9 +517,14 @@ if (HAS_NOTIFY && !HAS_FOCUS) fail('本地版应带「专注模式」按钮（�
     if (at('提醒声') >= 0 && !(at('提醒声') < at('跨会话备注框'))) {
       fail('备注框应排在提醒声之后，实得 ' + JSON.stringify(labels))
     }
-    // 专注模式紧挨着「提醒声」：它俩管的是同一件事（要不要出声）
-    if (at('专注模式') >= 0 && !(at('提醒声') < at('专注模式') && at('专注模式') < at('跨会话备注框'))) {
-      fail('专注模式应排在提醒声与备注框之间，实得 ' + JSON.stringify(labels))
+    // 专注模式由用户指定排在**最后一个功能按钮的右边**（「后台任务」之后）
+    if (at('专注模式') >= 0) {
+      if (at('专注模式') !== labels.length - 1) {
+        fail('专注模式应排在最后一个（「后台任务」右边），实得 ' + JSON.stringify(labels))
+      }
+      if (!(at('专注模式') > at('后台任务'))) {
+        fail('专注模式应排在「后台任务」右边，实得 ' + JSON.stringify(labels))
+      }
     }
     // 按钮文字恒定：不许把"专注中 / 还剩…"写进按钮（状态只能进 tooltip）
     if (HAS_FOCUS && /专注中|还剩|分钟/.test(String(labels[at('专注模式')]))) {
