@@ -498,6 +498,7 @@ const HAS_MINE = labels.some((l) => String(l).includes('扫雷'))
 const HAS_NOTE = labels.some((l) => String(l).includes('跨会话备注框'))
 const HAS_FARM = labels.some((l) => String(l).includes('Token农场'))
 const HAS_TASKS = labels.some((l) => String(l).includes('后台任务'))
+const HAS_FOCUS = labels.some((l) => String(l).includes('专注模式'))
 if (!labels.some((l) => String(l).includes('余额'))) fail('缺少余额按钮，实得 ' + JSON.stringify(labels))
 if (!labels.some((l) => String(l).includes('形象秀'))) fail('缺少 形象秀固定按钮，实得 ' + JSON.stringify(labels))
 if (!HAS_POOL) fail('缺少「美式八球」按钮，实得 ' + JSON.stringify(labels))
@@ -505,8 +506,9 @@ if (!HAS_MINE) fail('缺少「扫雷」按钮，实得 ' + JSON.stringify(labels
 if (!HAS_NOTE) fail('缺少「跨会话备注框」按钮，实得 ' + JSON.stringify(labels))
 if (!HAS_FARM) fail('缺少「Token农场」按钮，实得 ' + JSON.stringify(labels))
 if (!HAS_TASKS) fail('缺少「后台任务」按钮，实得 ' + JSON.stringify(labels))
+if (HAS_NOTIFY && !HAS_FOCUS) fail('本地版应带「专注模式」按钮（与提醒功能同生共死），实得 ' + JSON.stringify(labels))
 {
-  const want = 2 + (HAS_NOTIFY ? 1 : 0) + (HAS_POOL ? 1 : 0) + (HAS_MINE ? 1 : 0) + (HAS_NOTE ? 1 : 0) + (HAS_FARM ? 1 : 0) + (HAS_TASKS ? 1 : 0)
+  const want = 2 + (HAS_NOTIFY ? 1 : 0) + (HAS_FOCUS ? 1 : 0) + (HAS_POOL ? 1 : 0) + (HAS_MINE ? 1 : 0) + (HAS_NOTE ? 1 : 0) + (HAS_FARM ? 1 : 0) + (HAS_TASKS ? 1 : 0)
   if (toolBtns.length !== want) fail('工具条按钮数应为 ' + want + '，实际 ' + toolBtns.length)
   // 顺序也要钉住：备注框排在「提醒声」之后、「美式八球」之前（用户指定）
   {
@@ -514,6 +516,14 @@ if (!HAS_TASKS) fail('缺少「后台任务」按钮，实得 ' + JSON.stringify
     if (!(at('跨会话备注框') > 0)) fail('找不到备注框按钮')
     if (at('提醒声') >= 0 && !(at('提醒声') < at('跨会话备注框'))) {
       fail('备注框应排在提醒声之后，实得 ' + JSON.stringify(labels))
+    }
+    // 专注模式紧挨着「提醒声」：它俩管的是同一件事（要不要出声）
+    if (at('专注模式') >= 0 && !(at('提醒声') < at('专注模式') && at('专注模式') < at('跨会话备注框'))) {
+      fail('专注模式应排在提醒声与备注框之间，实得 ' + JSON.stringify(labels))
+    }
+    // 按钮文字恒定：不许把"专注中 / 还剩…"写进按钮（状态只能进 tooltip）
+    if (HAS_FOCUS && /专注中|还剩|分钟/.test(String(labels[at('专注模式')]))) {
+      fail('专注模式按钮文字不许带状态，实得 ' + JSON.stringify(labels[at('专注模式')]))
     }
     if (!(at('跨会话备注框') < at('美式八球'))) fail('备注框应排在美式八球之前，实得 ' + JSON.stringify(labels))
     if (!(at('Token农场') > at('扫雷'))) fail('农场应排在扫雷之后，实得 ' + JSON.stringify(labels))
@@ -3509,6 +3519,189 @@ console.log('\n=== 19. 后台任务浮窗：点开才看 / 列出正在跑的任
     if (lsData.get('dsh-skin-im2005.taskopen') !== '0') fail('开关应落盘')
   }
   ok('后台任务：关掉即不渲染，开关落盘')
+}
+
+console.log('\n=== 20. 专注模式：设定时长 / 期间不提醒 / 到点自动恢复 ===')
+if (!HAS_NOTIFY) {
+  // 公开版：专注模式与提醒功能一起被剥离 —— 不该有按钮、浮层、存储键
+  const labels20 = walk(render(regs.get('im2005-toolbar').comp), [])
+    .map((b) => (b.children || []).map((c) => (c && c.children) || c).join(''))
+  if (labels20.some((l) => String(l).includes('专注模式'))) fail('公开版不该有「专注模式」按钮')
+  if (regs.has('im2005-focus')) fail('公开版不该注册专注模式浮层')
+  if (lsData.has('dsh-skin-im2005.focus')) fail('公开版不该写专注模式存储键')
+  ok('无提醒功能的版本（公开版）-> 没有专注模式按钮 / 浮层 / 存储键')
+} else {
+  const focusInj = regs.get('im2005-focus').opts.inject()
+  const FMAX = focusInj.engine.FOCUS_MIN_MAX
+  const FDEF = focusInj.engine.FOCUS_DEFAULT_MIN
+  const mkF = focusInj.engine.create
+
+  // ① 纯逻辑：计时 / 夹取 / 存档（"到点自动恢复"的机制就是 active() 自己变 false）
+  {
+    let t = 1000
+    const f = mkF({ now: () => t })
+    if (f.active()) fail('没开始就不该是专注中')
+    f.start(1)
+    if (!f.active()) fail('开始后应处于专注中')
+    if (Math.abs(f.remaining() - 60000) > 1) fail('1 分钟应剩 60000ms，实得 ' + f.remaining())
+    t += 60000
+    if (f.active()) fail('时间到之后不该还算专注中 —— 这就是"自动恢复提醒"的机制')
+    if (f.remaining() !== 0) fail('时间到剩余应为 0，实得 ' + f.remaining())
+    ok('专注计时：start / remaining / 到点自动失效（纯逻辑）')
+
+    const g = mkF({ now: () => 0 })
+    g.start(0)
+    if (g.minutes() !== FDEF) fail('0 分钟应回落到默认 ' + FDEF + '，实得 ' + g.minutes())
+    g.start(9999)
+    if (g.minutes() !== FMAX) fail('超过上限应夹到 ' + FMAX + '，实得 ' + g.minutes())
+    g.start('2.6')
+    if (g.minutes() !== 3) fail('小数应四舍五入到 3，实得 ' + g.minutes())
+    g.start('abc')
+    if (g.minutes() !== FDEF) fail('非数字应回落默认值，实得 ' + g.minutes())
+    ok('专注时长：非法值回落 ' + FDEF + '、上限 ' + FMAX + '、小数取整')
+
+    const h = mkF({ now: () => 5000 })
+    h.start(45)
+    const sv = JSON.parse(JSON.stringify(h.serialize()))
+    const h2 = mkF({ now: () => 6000 })
+    if (!h2.restore(sv)) fail('自己写出的存档应该能读回')
+    if (h2.minutes() !== 45) fail('读回的分钟数不对，实得 ' + h2.minutes())
+    if (mkF({ now: () => 0 }).restore({ v: 9, until: 1 })) fail('版本号不认识时应拒绝（宁可当没存过）')
+    if (mkF({ now: () => 0 }).restore(null)) fail('空存档应拒绝')
+    if (mkF({ now: () => 0 }).restore({ v: 1, until: 'x' })) fail('until 不是数字应拒绝')
+    ok('专注存档：往返一致；版本不对 / 空值 / 坏数字一律丢弃')
+  }
+
+  // ② 浮窗渲染：默认关着不渲染，点按钮才出现；输入 → 开始 → 倒计时 → 提前结束/关窗
+  const walk20 = (n, out, d) => {
+    const dd = d || 0
+    if (!n || typeof n !== 'object' || dd > 16) return out
+    if (typeof n.type === 'function') {
+      try { return walk20(instantiate(n.type, n.props), out, dd + 1) } catch (e) { fail('专注面板渲染抛错: ' + e.message) }
+    }
+    out.push(n)
+    ;(n.children || []).forEach((c) => walk20(c, out, dd + 1))
+    return out
+  }
+  const txt20 = (n, d) => {
+    const dd = d || 0
+    if (dd > 16 || n === null || n === undefined) return ''
+    if (typeof n === 'string' || typeof n === 'number') return String(n)
+    if (typeof n !== 'object') return ''
+    if (typeof n.type === 'function') {
+      try { return txt20(instantiate(n.type, n.props), dd + 1) } catch (e) { return '' }
+    }
+    let s = ''
+    ;(n.children || []).forEach((c) => { s += ' ' + txt20(c, dd + 1) })
+    return s
+  }
+  const tree20 = (props) => walk20(instantiate(regs.get('im2005-focus').comp, props || focusInj), [], 0)
+  // 面板的文字：tree20() 返回节点数组，根节点可能是函数组件的产物，交给 txt20 递归
+  const txtAll = () => { const t = tree20(); return t.length ? txt20(t[0]) : '' }
+  const btn20 = (label) => tree20().find((n) => n.type === 'button' && txt20(n).trim() === label)
+  const focusBtn = () => walk(render(regs.get('im2005-toolbar').comp), [])
+    .find((b) => JSON.stringify(b.children || '').includes('专注模式'))
+
+  const realNow20 = Date.now
+  let clock20 = 500000
+  Date.now = () => clock20
+  // 专注的每秒定时器在测试里换成空实现：别让进程挂着（也别让它在断言之间偷偷改状态）
+  const realSetInterval20 = globalThis.setInterval
+  globalThis.setInterval = () => 0
+  const sounds = () => fake.audioPlays + fake.bursts / 2
+  const sample20 = async () => { fake.moCbs.forEach((cb) => cb()); await new Promise((r) => setTimeout(r, 25)) }
+  try {
+    const fb = focusBtn()
+    if (!fb) fail('找不到「专注模式」按钮')
+    if (tree20().length) fail('没点按钮前不该渲染专注面板')
+    fb.props.onClick()
+    if (!tree20().length) fail('点了「专注模式」按钮后应出现面板')
+    if (!/专注几分钟/.test(txt20(tree20()[0]))) fail('面板里应有"专注几分钟"的输入')
+    const inp = tree20().find((n) => n.type === 'input')
+    if (!inp) fail('面板里应有分钟输入框')
+    if (!btn20('开始专注')) fail('面板里应有「开始专注」按钮')
+    const notifyKeyBefore = lsData.get('dsh-skin-im2005.notify')
+    ok('专注面板：不点不渲染；点开有分钟输入框与「开始专注」')
+
+    // 输入 2 分钟 → 开始（走界面路径）
+    inp.props.onChange({ target: { value: '2' } })
+    btn20('开始专注').props.onClick()
+    const savedF = JSON.parse(lsData.get('dsh-skin-im2005.focus') || 'null')
+    if (!savedF || !(savedF.until > clock20)) fail('开始专注应把绝对结束时间落盘，实得 ' + JSON.stringify(savedF))
+    if (savedF.minutes !== 2) fail('落盘的分钟数应为 2，实得 ' + savedF.minutes)
+    if (!/提前结束/.test(txtAll())) {
+      fail('专注中面板应显示倒计时与「提前结束」，实得 ' + JSON.stringify(txtAll().slice(0, 120)))
+    }
+    if (!/01:5\d|02:00/.test(txtAll())) fail('专注中应显示剩余时间，实得 ' + JSON.stringify(txtAll().slice(0, 120)))
+    if (!/还剩/.test(String((focusBtn() || {}).props.title || ''))) {
+      fail('按钮 tooltip 应写明剩余时间（状态进 tooltip，不进按钮文字）')
+    }
+    ok('开始专注 → 倒计时 + 落盘 + tooltip 写明剩余时间')
+
+    // ③ 专注期间：任务完成 / 需要你确认 都不提醒
+    let base20 = sounds()
+    fake.running = true; await sample20(); clock20 += 3000
+    fake.running = false; await sample20()
+    if (sounds() !== base20) fail('专注期间任务完成不该提醒，实得 ' + (sounds() - base20))
+    clock20 += 3000      // 跨过 2 秒冷却，免得"没响"是被冷却拦的（那样断言会假通过）
+    fake.pendingKeys.approval = ['focus-a1']
+    await sample20()
+    if (sounds() !== base20) fail('专注期间「需要你确认」也不该提醒，实得 ' + (sounds() - base20))
+    fake.pendingKeys.approval = []
+    await sample20()
+    ok('专注期间：任务完成与「需要你确认」都不提醒')
+
+    // ④ 到点**自动**恢复：不做任何操作，只把时间推过去
+    clock20 = savedF.until + 1000
+    fake.running = true; await sample20(); clock20 += 3000
+    fake.running = false; await sample20()
+    if (sounds() - base20 !== 1) fail('专注结束后应自动恢复提醒，实得 ' + (sounds() - base20))
+    ok('专注结束 → 不需要任何操作，提醒自动恢复')
+
+    // ⑤ 不串台：整个过程中不许改写提醒开关
+    if (lsData.get('dsh-skin-im2005.notify') !== notifyKeyBefore) {
+      fail('专注模式改写了提醒开关（串台）—— 专注结束不该顺带打开/关掉用户的提醒')
+    }
+    ok('专注模式不碰提醒开关（只写自己的两个键）')
+
+    // ⑥ 提前结束 → 回到输入态；关窗 → 不渲染 + 开关落盘
+    btn20('开始专注') && btn20('开始专注').props.onClick()   // 先再开一次
+    if (!btn20('提前结束')) fail('应该已经又开始专注了')
+    btn20('提前结束').props.onClick()
+    if (/提前结束/.test(txtAll())) fail('提前结束后应回到输入态')
+    if (!/开始专注/.test(txtAll())) fail('提前结束后应能再次开始')
+    if (JSON.parse(lsData.get('dsh-skin-im2005.focus')).until !== 0) fail('提前结束应把存档里的 until 清零')
+    ok('提前结束 → 回到输入态、until 归零')
+
+    // 关窗：专注继续跑（窗口只是显示）；开关落盘
+    btn20('开始专注').props.onClick()
+    if (!/提前结束/.test(txtAll())) fail('应该又进入了专注中')
+    btn20('✕').props.onClick()
+    if (tree20().length) fail('关掉后不该渲染任何节点')
+    if (lsData.get('dsh-skin-im2005.focusopen') !== '0') fail('面板开关应落盘')
+    if (!(JSON.parse(lsData.get('dsh-skin-im2005.focus')).until > clock20)) fail('关窗不该把专注一起停掉')
+    ok('关窗 → 不渲染、开关落盘、专注照常计时')
+
+    // ⑦ 静态审计：专注模式的五个标记区里不许出现提醒开关的任何写入口
+    {
+      const src20 = (await import('node:fs')).readFileSync(file.replace('file:///', ''), 'utf8')
+      const region = (tag) => {
+        const i = src20.indexOf('/* ' + tag + ':BEGIN */')
+        const j = src20.indexOf('/* ' + tag + ':END */')
+        return (i >= 0 && j > i) ? src20.slice(i, j) : ''
+      }
+      const code = ['FOCUS', 'FOCUS-STORE', 'FOCUS-BUTTON', 'FOCUS-TOGGLE', 'FOCUS-VIEW'].map(region).join('\n')
+      if (!code.trim()) fail('找不到 FOCUS 标记区（标记被打掉就没法保证公开版剥干净）')
+      if (/writeNotifyFlag|NOTIFY_KEY|toggleNotify/.test(code)) {
+        fail('专注模式区域里出现了提醒开关的写入口 —— 关专注会把用户的提醒开关一起改掉')
+      }
+      if (!/focusActive/.test(code)) fail('专注区域里应该能看到 focusActive（提醒的唯一判据）')
+      ok('静态审计：专注区域不碰提醒开关，只读自己的状态')
+    }
+  } finally {
+    Date.now = realNow20
+    globalThis.setInterval = realSetInterval20
+  }
 }
 
 console.log('\nALL CHECKS PASSED ✓')

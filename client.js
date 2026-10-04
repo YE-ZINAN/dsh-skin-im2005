@@ -145,6 +145,8 @@ window.__ModuleLoader__.load({
         // 公开版：本地专属的提醒功能已整体剥离。
 
 
+    
+
     /* ================================================================== *
      * 美式八球引擎 —— 纯逻辑，不碰 DOM
      *
@@ -1939,6 +1941,7 @@ window.__ModuleLoader__.load({
       setNickname: null,
       
       
+      
       /* GAME-UI-STORE:BEGIN */
       // 美式八球：窗口开关 / 按钮 tooltip 上的存档说明 / 任务完成提示 / 对手 / 难度 / 音效
       poolOpen: false,
@@ -2394,6 +2397,7 @@ window.__ModuleLoader__.load({
         btn('pin', '形象秀',
           s.pinned ? '形象秀 面板已固定（点击取消，面板可以收起）' : '点击固定 形象秀 面板',
           () => { try { if (s.togglePin) s.togglePin() } catch (err) {} }, s.pinned),
+        
         
         /* GAME-BUTTON:BEGIN */
         // 跨会话备注框：所有会话共用一块草稿纸。用户要求它排在「提醒按钮」和美式八球之间
@@ -5201,6 +5205,8 @@ window.__ModuleLoader__.load({
 
         
 
+        
+
         // ---- 形象秀 固定 ----
         store.togglePin = () => store.set({ pinned: !store.pinned })
 
@@ -5469,6 +5475,7 @@ window.__ModuleLoader__.load({
               view: TASK_VIEW,
             }),
           }],
+          
           // 跨会话备注框（浮层）。内容/位置/开关都走 inject，测试拿到同一条路径。
           ['shell.overlay', 'im2005-note', ImNoteWindow, {
             inject: () => ({
