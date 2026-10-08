@@ -1,12 +1,11 @@
 {
   "name": "dsh-skin-im2005",
-  "version": "1.16.1",
+  "version": "1.16.2",
   "description": "IM2005 - a 2005-era instant-messenger look for DeepSeek Harness (unofficial, original artwork only).",
   "type": "module",
   "license": "MIT",
   "keywords": [
     "deepseek-harness",
-    "deepseek-harness-plugin",
     "dsh",
     "dsh-plugin",
     "skin",
@@ -15,10 +14,6 @@
     "2005",
     "im"
   ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/YE-ZINAN/dsh-skin-im2005.git"
-  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

@@ -3494,7 +3494,10 @@ console.log('\n=== 19. 后台任务浮窗：点开才看 / 列出正在跑的任
   if (!tree.length) fail('点了「后台任务」按钮后应该出现浮窗')
   const box = tree.find((n) => n.props && n.props.className === 'dsh-skin-im2005-task')
   if (!box) fail('找不到浮窗容器')
-  if (!(box.props.style.zIndex > 2000000000)) fail('层级应压过普通界面（实得 ' + box.props.style.zIndex + '）')
+  // 层级：压在普通界面/菜单之上，但**必须低于宿主模态框（1000）** —— 见第 23 节的层级表
+  if (!(box.props.style.zIndex > 101 && box.props.style.zIndex < 1000)) {
+    fail('层级应在 (101, 1000) 区间（压过菜单、低于宿主模态框），实得 ' + box.props.style.zIndex)
+  }
   if (!/现在没有在跑的任务/.test(txt(instTask()))) {
     fail('没有任务时应明说"现在没有在跑的任务"，实得 ' + JSON.stringify(txt(instTask()).slice(0, 120)))
   }
@@ -3949,7 +3952,9 @@ console.log('\n=== 21. 德州扑克：九档牌型辅助 + 6 人桌对局 + 摊�
     const tree = walkP(inst(), [])
     const box = tree.find((n) => n.props && n.props.className === 'dsh-skin-im2005-poker')
     if (!box) fail('点了按钮后应出现牌桌浮窗')
-    if (!(box.props.style.zIndex > 2000000000)) fail('牌桌层级应压过普通界面')
+    if (!(box.props.style.zIndex > 101 && box.props.style.zIndex < 1000)) {
+      fail('牌桌层级应在 (101, 1000)：压过菜单、低于宿主模态框，实得 ' + box.props.style.zIndex)
+    }
 
     const tiers = tree.filter((n) => n.props && String(n.props.className || '').indexOf('dsh-skin-im2005-poker-tier') === 0)
     if (tiers.length !== 9) fail('牌型天梯应是 9 档（皇家同花顺算同花顺的特例，不单列第 10 档），实得 ' + tiers.length)
@@ -4139,6 +4144,84 @@ console.log('\n=== 21. 德州扑克：九档牌型辅助 + 6 人桌对局 + 摊�
   }
   ok('耐久：' + hands + ' 局 / ' + steps + ' 个动作，每个动作后都渲染一次真实组件，'
     + '没有一次被错误边界接管（' + Math.round((Date.now() - t0) / 1000) + 's）')
+}
+
+console.log('\n=== 23. 层级：皮肤浮窗必须低于宿主模态框（1000）、高于菜单（101）===')
+{
+  // 宿主层级表（从 app.asar 的 CSS 里读出来的真实取值）：
+  //   10/11/15/20 布局框架 · 30 侧栏按钮 · 100/101 菜单与输入建议
+  //   **1000 模态框层**（primitives/Modal.module.css: .root{position:fixed;inset:0;z-index:1000}）
+  //   1100 模态框内弹层 · 2147483647 桌面外壳最顶层
+  // 用户报"新开会话后无法选择工作区位置"就是这个区间的错：皮肤原来用 2147483000，
+  // 每个浮窗都盖在目录选择器（模态框）**和它的遮罩之上** → 点击落到皮肤上。
+  const HOST_MENU = 101
+  const HOST_MODAL = 1000
+  const srcZ = fs.readFileSync('dsh-skin-im2005/client.js', 'utf8')
+  const m = /const Z = (\d+)/.exec(srcZ)
+  if (!m) fail('找不到皮肤的基础层级常量 Z')
+  const ZV = Number(m[1])
+  if (!(ZV > HOST_MENU)) fail('Z=' + ZV + ' 太低：皮肤浮窗会被宿主菜单（' + HOST_MENU + '）盖住')
+  if (!(ZV < HOST_MODAL)) {
+    fail('Z=' + ZV + ' 太高：皮肤浮窗会盖住宿主模态框（z-index:' + HOST_MODAL
+      + '）—— 这就是「目录选择器点不动」的根因')
+  }
+  const seen = []
+  for (const mm of srcZ.matchAll(/zIndex:\s*([^,\n]+)/g)) {
+    const expr = mm[1].trim()
+    let v = null
+    if (/^\d+$/.test(expr)) v = Number(expr)
+    else if (expr === 'Z') v = ZV
+    else {
+      const g = /^Z\s*([+-])\s*(\d+)$/.exec(expr)
+      if (g) v = ZV + (g[1] === '-' ? -1 : 1) * Number(g[2])
+      else if (expr === 'POOL_VIEW.z') {
+        const pv = /POOL_VIEW\.z = Z \+ (\d+)/.exec(srcZ)
+        if (pv) v = ZV + Number(pv[1])
+      }
+    }
+    if (v === null) continue
+    seen.push(expr + '=' + v)
+    if (v >= HOST_MODAL) fail('有浮窗层级越过了宿主模态框：' + expr + ' = ' + v)
+    if (v < 1) fail('有浮窗层级非法：' + expr + ' = ' + v)
+  }
+  if (seen.length < 8) fail('只求值到 ' + seen.length + ' 个层级表达式，源码结构可能变了')
+  // 代码里（去掉注释）不许再留"压过一切"的字面量
+  const codeOnly = srcZ.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')
+    .filter((L) => !/^\s*(\/\/|\*)/.test(L)).join('\n')
+  for (const banned of ['2147483000', '2147483647']) {
+    if (codeOnly.includes(banned)) fail('代码里还留着层级字面量 ' + banned + '（会盖住宿主模态框）')
+  }
+  // 端到端：真渲染出来的窗口，根节点层级也得合规
+  const poolInj = regs.get('im2005-pool').opts.inject()
+  if (!(poolInj.view.z > HOST_MENU && poolInj.view.z < HOST_MODAL)) {
+    fail('球桌窗口层级不合规：' + poolInj.view.z + '（须在 ' + HOST_MENU + ' 与 ' + HOST_MODAL + ' 之间）')
+  }
+  {
+    const walkZ = (n, out, d) => {
+      const dd = d || 0
+      if (!n || typeof n !== 'object' || dd > 18) return out
+      if (typeof n.type === 'function') return walkZ(instantiate(n.type, n.props), out, dd + 1)
+      out.push(n)
+      ;(n.children || []).forEach((c) => walkZ(c, out, dd + 1))
+      return out
+    }
+    const compZ = regs.get('im2005-poker').comp
+    const injZ = regs.get('im2005-poker').opts.inject()
+    const findBox = () => walkZ(instantiate(compZ, injZ), [], 0)
+      .find((n) => n.props && n.props.className === 'dsh-skin-im2005-poker')
+    let box = findBox()
+    for (let k = 0; !box && k < 3; k++) {
+      walk(instantiate(regs.get('im2005-toolbar').comp), [])
+        .find((b) => b.type === 'button' && JSON.stringify(b.children || '').includes('德州扑克')).props.onClick()
+      box = findBox()
+    }
+    if (!box) fail('牌桌没渲染出来，无法核对层级')
+    if (!(box.props.style.zIndex > HOST_MENU && box.props.style.zIndex < HOST_MODAL)) {
+      fail('牌桌根节点层级不合规：' + box.props.style.zIndex)
+    }
+  }
+  ok('层级：Z=' + ZV + '（> 菜单 ' + HOST_MENU + '、< 宿主模态框 ' + HOST_MODAL + '）；'
+    + seen.length + ' 处层级表达式全部合规（' + seen.slice(0, 5).join('、') + ' …）；牌桌根节点也合规')
 }
 
 console.log('\nALL CHECKS PASSED ✓')
