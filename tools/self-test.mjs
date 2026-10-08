@@ -3494,9 +3494,9 @@ console.log('\n=== 19. 后台任务浮窗：点开才看 / 列出正在跑的任
   if (!tree.length) fail('点了「后台任务」按钮后应该出现浮窗')
   const box = tree.find((n) => n.props && n.props.className === 'dsh-skin-im2005-task')
   if (!box) fail('找不到浮窗容器')
-  // 层级：压在普通界面/菜单之上，但**必须低于宿主模态框（1000）** —— 见第 23 节的层级表
-  if (!(box.props.style.zIndex > 101 && box.props.style.zIndex < 1000)) {
-    fail('层级应在 (101, 1000) 区间（压过菜单、低于宿主模态框），实得 ' + box.props.style.zIndex)
+  // 层级：压在普通界面/布局之上（>70），但**必须低于宿主菜单（100）** —— 见第 23 节的层级表
+  if (!(box.props.style.zIndex > 70 && box.props.style.zIndex < 100)) {
+    fail('层级应在 (70, 100) 区间（压过布局、低于宿主菜单与模态框），实得 ' + box.props.style.zIndex)
   }
   if (!/现在没有在跑的任务/.test(txt(instTask()))) {
     fail('没有任务时应明说"现在没有在跑的任务"，实得 ' + JSON.stringify(txt(instTask()).slice(0, 120)))
@@ -3952,8 +3952,8 @@ console.log('\n=== 21. 德州扑克：九档牌型辅助 + 6 人桌对局 + 摊�
     const tree = walkP(inst(), [])
     const box = tree.find((n) => n.props && n.props.className === 'dsh-skin-im2005-poker')
     if (!box) fail('点了按钮后应出现牌桌浮窗')
-    if (!(box.props.style.zIndex > 101 && box.props.style.zIndex < 1000)) {
-      fail('牌桌层级应在 (101, 1000)：压过菜单、低于宿主模态框，实得 ' + box.props.style.zIndex)
+    if (!(box.props.style.zIndex > 70 && box.props.style.zIndex < 100)) {
+      fail('牌桌层级应在 (70, 100)：压过布局、低于宿主菜单与模态框，实得 ' + box.props.style.zIndex)
     }
 
     const tiers = tree.filter((n) => n.props && String(n.props.className || '').indexOf('dsh-skin-im2005-poker-tier') === 0)
@@ -4146,24 +4146,26 @@ console.log('\n=== 21. 德州扑克：九档牌型辅助 + 6 人桌对局 + 摊�
     + '没有一次被错误边界接管（' + Math.round((Date.now() - t0) / 1000) + 's）')
 }
 
-console.log('\n=== 23. 层级：皮肤浮窗必须低于宿主模态框（1000）、高于菜单（101）===')
+console.log('\n=== 23. 层级：皮肤浮窗必须低于宿主菜单（100）与模态框（1000）===')
 {
   // 宿主层级表（从 app.asar 的 CSS 里读出来的真实取值）：
-  //   10/11/15/20 布局框架 · 30 侧栏按钮 · 100/101 菜单与输入建议
+  //   10/11/15/20 布局框架 · 30 侧栏按钮 · 40/70 dockkit 右栏与其浮动层
+  //   **100/101 菜单与下拉**（primitives/Menu.module.css = 101）
   //   **1000 模态框层**（primitives/Modal.module.css: .root{position:fixed;inset:0;z-index:1000}）
   //   1100 模态框内弹层 · 2147483647 桌面外壳最顶层
-  // 用户报"新开会话后无法选择工作区位置"就是这个区间的错：皮肤原来用 2147483000，
-  // 每个浮窗都盖在目录选择器（模态框）**和它的遮罩之上** → 点击落到皮肤上。
-  const HOST_MENU = 101
+  // 用户报「选择工作区后自动弹回未选择、分组显示未定义工作区」就是这个区间写错了：
+  // 0.19.2 之前 Z=2147483000、0.19.2 是 900 —— 两次都还在**菜单（101）之上**，菜单项点不到。
+  const HOST_DOCK = 70
+  const HOST_MENU = 100
   const HOST_MODAL = 1000
   const srcZ = fs.readFileSync('dsh-skin-im2005/client.js', 'utf8')
   const m = /const Z = (\d+)/.exec(srcZ)
   if (!m) fail('找不到皮肤的基础层级常量 Z')
   const ZV = Number(m[1])
-  if (!(ZV > HOST_MENU)) fail('Z=' + ZV + ' 太低：皮肤浮窗会被宿主菜单（' + HOST_MENU + '）盖住')
-  if (!(ZV < HOST_MODAL)) {
-    fail('Z=' + ZV + ' 太高：皮肤浮窗会盖住宿主模态框（z-index:' + HOST_MODAL
-      + '）—— 这就是「目录选择器点不动」的根因')
+  if (!(ZV > HOST_DOCK)) fail('Z=' + ZV + ' 太低：皮肤浮窗会被 dockkit 浮动层（' + HOST_DOCK + '）盖住')
+  if (!(ZV < HOST_MENU)) {
+    fail('Z=' + ZV + ' 太高：皮肤浮窗会盖住宿主菜单/下拉（z-index:' + HOST_MENU
+      + '）—— 这就是「选了工作区又弹回未选择」的根因')
   }
   const seen = []
   for (const mm of srcZ.matchAll(/zIndex:\s*([^,\n]+)/g)) {
@@ -4181,6 +4183,7 @@ console.log('\n=== 23. 层级：皮肤浮窗必须低于宿主模态框（1000�
     }
     if (v === null) continue
     seen.push(expr + '=' + v)
+    if (v >= HOST_MENU) fail('有浮窗层级越过了宿主菜单：' + expr + ' = ' + v + '（必须 < ' + HOST_MENU + '）')
     if (v >= HOST_MODAL) fail('有浮窗层级越过了宿主模态框：' + expr + ' = ' + v)
     if (v < 1) fail('有浮窗层级非法：' + expr + ' = ' + v)
   }
@@ -4189,12 +4192,12 @@ console.log('\n=== 23. 层级：皮肤浮窗必须低于宿主模态框（1000�
   const codeOnly = srcZ.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')
     .filter((L) => !/^\s*(\/\/|\*)/.test(L)).join('\n')
   for (const banned of ['2147483000', '2147483647']) {
-    if (codeOnly.includes(banned)) fail('代码里还留着层级字面量 ' + banned + '（会盖住宿主模态框）')
+    if (codeOnly.includes(banned)) fail('代码里还留着层级字面量 ' + banned + '（会盖住宿主菜单/模态框）')
   }
   // 端到端：真渲染出来的窗口，根节点层级也得合规
   const poolInj = regs.get('im2005-pool').opts.inject()
-  if (!(poolInj.view.z > HOST_MENU && poolInj.view.z < HOST_MODAL)) {
-    fail('球桌窗口层级不合规：' + poolInj.view.z + '（须在 ' + HOST_MENU + ' 与 ' + HOST_MODAL + ' 之间）')
+  if (!(poolInj.view.z > HOST_DOCK && poolInj.view.z < HOST_MENU)) {
+    fail('球桌窗口层级不合规：' + poolInj.view.z + '（须在 ' + HOST_DOCK + ' 与 ' + HOST_MENU + ' 之间）')
   }
   {
     const walkZ = (n, out, d) => {
@@ -4216,11 +4219,12 @@ console.log('\n=== 23. 层级：皮肤浮窗必须低于宿主模态框（1000�
       box = findBox()
     }
     if (!box) fail('牌桌没渲染出来，无法核对层级')
-    if (!(box.props.style.zIndex > HOST_MENU && box.props.style.zIndex < HOST_MODAL)) {
-      fail('牌桌根节点层级不合规：' + box.props.style.zIndex)
+    if (!(box.props.style.zIndex > HOST_DOCK && box.props.style.zIndex < HOST_MENU)) {
+      fail('牌桌根节点层级不合规：' + box.props.style.zIndex
+        + '（须在 ' + HOST_DOCK + ' 与 ' + HOST_MENU + ' 之间）')
     }
   }
-  ok('层级：Z=' + ZV + '（> 菜单 ' + HOST_MENU + '、< 宿主模态框 ' + HOST_MODAL + '）；'
+  ok('层级：Z=' + ZV + '（> dockkit ' + HOST_DOCK + '、< 宿主菜单 ' + HOST_MENU + '、< 模态框 ' + HOST_MODAL + '）；'
     + seen.length + ' 处层级表达式全部合规（' + seen.slice(0, 5).join('、') + ' …）；牌桌根节点也合规')
 }
 
